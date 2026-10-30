@@ -797,13 +797,21 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _player = [[VCPlayer alloc] init];
-        _proc = [[VCProc alloc] init];
         _renderLock = [[NSLock alloc] init];
         _dedupLock = [[NSLock alloc] init];
         _lastEn = -1; _lastRot = -1; _lastPaused = -1;
         _lastZoom = -1;
         _lastMirror = NO; _lastLightOn = NO; _lastLightColor = 0;
+        // 对照原源码 VCamCore init：SpringBoard 里 lean 初始化，
+        // 不创建 player/proc（避免 VT session/dlopen 在 SpringBoard 早期卡住，
+        // 导致 [VCCore shared] 不返回，show 永远执行不到）
+        BOOL isSB = [[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"];
+        if (!isSB) {
+            _player = [[VCPlayer alloc] init];
+            _proc = [[VCProc alloc] init];
+        } else {
+            vcamLog(@"[vcam] VCCore initialized lean in SpringBoard (no decoder/renderer)");
+        }
     }
     return self;
 }
@@ -827,6 +835,7 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     dispatch_resume(_timer);
 }
 - (void)poll {
+    if (!_isMsd) return;   // SpringBoard 里不解码不渲染，只负责 UI 写 plist
     @try {
         NSDictionary *pl = plRead();
         NSInteger en = [pl[@"enabled"] boolValue] ? 1 : 0;
@@ -1018,6 +1027,17 @@ static void installHooks(void) {
 }
 
 // ======================= 复古仪表盘 UI =======================
+// 悬浮球专用日志：无条件写（不受 logEnabled 控制），对照原源码 vcam_ball_log
+static void vcamBallLog(NSString *m) {
+    @try {
+        NSString *p = @"/tmp/vcam_ball_log.txt";
+        NSString *e = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) [e writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        else { [fh seekToEndOfFile]; [fh writeData:[e dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    } @catch (NSException *e) {}
+}
+
 static UIColor *CGold(void)   { return [UIColor colorWithRed:0.83 green:0.69 blue:0.42 alpha:1.0]; }
 static UIColor *CGoldDk(void) { return [UIColor colorWithRed:0.55 green:0.44 blue:0.23 alpha:1.0]; }
 static UIColor *CDeep(void)   { return [UIColor colorWithRed:0.02 green:0.04 blue:0.02 alpha:1.0]; }
@@ -1119,7 +1139,11 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)show {
     if (_floating) return;
     _floating = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{ [self build]; });
+    vcamBallLog(@"[vcam] VCBall show called");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        vcamBallLog(@"[vcam] VCBall build on main queue");
+        [self build];
+    });
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didActive) name:UIApplicationDidBecomeActiveNotification object:nil];
 }
 - (void)hide {
@@ -1136,8 +1160,10 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 - (void)didActive {
+    vcamBallLog(@"[vcam] VCBall didActive");
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self->_floating && self.win && self.win.windowScene == nil) {
+            vcamBallLog(@"[vcam] VCBall window has no scene, recreating");
             [self.win removeFromSuperview];
             self.win = nil;
             [self build];
@@ -1145,10 +1171,12 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     });
 }
 - (void)build {
+    vcamBallLog(@"[vcam] VCBall build begin");
     @try {
         [self _build];
+        vcamBallLog(@"[vcam] VCBall build done");
     } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"VCBall build exception: %@", e]);
+        vcamBallLog([NSString stringWithFormat:@"[vcam] VCBall build exception: %@", e]);
     }
 }
 - (void)_build {
@@ -1178,6 +1206,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 
     [self buildPanel];
     [_win addSubview:_ball];
+    vcamBallLog([NSString stringWithFormat:@"[vcam] VCBall added to window, bounds=%@", NSStringFromCGRect(sb)]);
 }
 - (void)buildPanel {
     CGFloat pw = 250, ph = 400, pad = 12;
@@ -1549,6 +1578,7 @@ static void vcamInit(void) {
     @autoreleasepool {
         NSString *name = [[NSProcessInfo processInfo] processName];
         vcamLog([NSString stringWithFormat:@"[vcam] loaded in %@", name]);
+        vcamBallLog([NSString stringWithFormat:@"[vcam] loaded in %@", name]);
         if ([name isEqualToString:@"mediaserverd"]) {
             [[VCCore shared] startRender];
             installHooks();
