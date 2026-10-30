@@ -1,7 +1,6 @@
 //
 //  Tweak.m
 //  VCamPlus · 复古仪表盘 · 单文件
-//  功能：悬浮球 / 选择视频 / 替原 / 旋转 / 方向 / 缩放 / 镜像 / 复原 / 彩色注入（含参数）
 //
 
 #import <Foundation/Foundation.h>
@@ -15,6 +14,8 @@
 #import <dlfcn.h>
 #import <unistd.h>
 #import <math.h>
+#import <string.h>
+#import <mach-o/dyld.h>
 
 // ======================= 日志 =======================
 static BOOL vcamLogOn(void) {
@@ -37,6 +38,42 @@ static void vcamLog(NSString *m) {
         if (!fh) [e writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
         else { [fh seekToEndOfFile]; [fh writeData:[e dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
     } @catch (NSException *e) {}
+}
+
+// 无条件信标：不依赖 logEnabled，多路径写入
+static void vcamLoadBeacon(NSString *processName) {
+    NSString *line = [NSString stringWithFormat:@"[%@] loaded in %@ (pid %d)\n",
+                      [NSDate date], processName, getpid()];
+    NSArray *paths = @[@"/var/mobile/Media/DCIM/vcam_load.txt",
+                       @"/tmp/vcam_load.txt",
+                       @"/private/tmp/vcam_load.txt",
+                       @"/var/tmp/vcam_load.txt"];
+    for (NSString *p in paths) {
+        @try {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (!fh) [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        } @catch (NSException *e) {}
+    }
+}
+
+// 双布局防重入
+static void vcamInit(void);
+static BOOL vcamLoadedViaOtherPath(void) {
+    Dl_info info;
+    if (!dladdr((void *)&vcamInit, &info) || !info.dli_fname) return NO;
+    const char *selfPath = info.dli_fname;
+    const char *selfBase = strrchr(selfPath, '/');
+    selfBase = selfBase ? selfBase + 1 : selfPath;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *p = _dyld_get_image_name(i);
+        if (!p || strcmp(p, selfPath) == 0) continue;
+        const char *base = strrchr(p, '/');
+        base = base ? base + 1 : p;
+        if (strcmp(base, selfBase) == 0) return YES;
+    }
+    return NO;
 }
 
 // ======================= plist IPC =======================
@@ -144,7 +181,6 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
     return self;
 }
 - (void)dealloc { [self stop]; [_queue clear]; }
-
 - (void)load:(NSString *)p {
     if (!p || p.length == 0) return;
     if ([p isEqualToString:_failedPath] && CFAbsoluteTimeGetCurrent() - _failedAt < 5.0) return;
@@ -161,7 +197,6 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
     [_thread start];
 }
 - (void)stop { _shouldRun = NO; }
-
 - (void)rebuild {
     @try {
         if (_reader) { [_reader cancelReading]; _reader = nil; }
@@ -185,9 +220,7 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
             if (!b) break;
             [_queue push:b]; CVPixelBufferRelease(b);
         }
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"rebuild exception: %@", e]);
-    }
+    } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"rebuild exception: %@", e]); }
 }
 - (void)restartReader {
     @try {
@@ -207,9 +240,7 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
         if (![_reader canAddOutput:_output]) { _reader = nil; _output = nil; return; }
         [_reader addOutput:_output];
         if (![_reader startReading]) { [_reader cancelReading]; _reader = nil; _output = nil; }
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"restartReader exception: %@", e]);
-    }
+    } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"restartReader exception: %@", e]); }
 }
 - (CVPixelBufferRef)read CF_RETURNS_RETAINED {
     if (!_output || _reader.status != AVAssetReaderStatusReading) return NULL;
@@ -239,23 +270,17 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
                                      options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
         NSArray *t = [_asset tracksWithMediaType:AVMediaTypeVideo];
         if (!t || t.count == 0) {
-            vcamLog(@"no video track, clean up");
+            vcamLog(@"no video track");
             if (_reader) { [_reader cancelReading]; _reader = nil; }
-            _output = nil;
-            _track = nil;
-            _failedPath = [p copy];
-            _failedAt = CFAbsoluteTimeGetCurrent();
+            _output = nil; _track = nil;
+            _failedPath = [p copy]; _failedAt = CFAbsoluteTimeGetCurrent();
             return;
         }
-        _path = [p copy];
-        _failedPath = nil;
-        _track = t[0];
+        _path = [p copy]; _failedPath = nil; _track = t[0];
         _w = (size_t)_track.naturalSize.width;
         _h = (size_t)_track.naturalSize.height;
         _fps = _track.nominalFrameRate > 1 ? _track.nominalFrameRate : 30.0;
-        _effFps = 0;
-        _hasLastPTS = NO;
-        _lastPTS = 0;
+        _effFps = 0; _hasLastPTS = NO; _lastPTS = 0;
         CGAffineTransform pt = _track.preferredTransform;
         if (pt.a == 0 && pt.b == 1 && pt.c == -1 && pt.d == 0) _preferredRotation = 90;
         else if (pt.a == -1 && pt.b == 0 && pt.c == 0 && pt.d == -1) _preferredRotation = 180;
@@ -265,10 +290,8 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
     } @catch (NSException *e) {
         vcamLog([NSString stringWithFormat:@"applyPath exception: %@", e]);
         if (_reader) { [_reader cancelReading]; _reader = nil; }
-        _output = nil;
-        _track = nil;
-        _failedPath = [p copy];
-        _failedAt = CFAbsoluteTimeGetCurrent();
+        _output = nil; _track = nil;
+        _failedPath = [p copy]; _failedAt = CFAbsoluteTimeGetCurrent();
     }
 }
 - (void)loop {
@@ -299,7 +322,7 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
 }
 @end
 
-// ======================= 镜像（CPU 行反转） =======================
+// ======================= 镜像 =======================
 static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
     if (!pb) return;
     CVPixelBufferLockBaseAddress(pb, 0);
@@ -340,16 +363,12 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
     CVPixelBufferUnlockBaseAddress(pb, 0);
 }
 
-// ======================= 图像处理 =======================
-// 附件拷贝（兼容 iOS 14；CVBufferCopyAttachments 是 iOS 15+ API）
+// ======================= 附件拷贝（iOS 14 兼容） =======================
 static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (!src || !dst) return;
     if (@available(iOS 15.0, *)) {
         CFDictionaryRef atts = CVBufferCopyAttachments(src, kCVAttachmentMode_ShouldPropagate);
-        if (atts) {
-            CVBufferSetAttachments(dst, atts, kCVAttachmentMode_ShouldPropagate);
-            CFRelease(atts);
-        }
+        if (atts) { CVBufferSetAttachments(dst, atts, kCVAttachmentMode_ShouldPropagate); CFRelease(atts); }
     } else {
         static CFStringRef keys[3];
         static dispatch_once_t once;
@@ -365,6 +384,7 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     }
 }
 
+// ======================= 图像处理 =======================
 @interface VCProc : NSObject
 @property (nonatomic, assign) VTPixelTransferSessionRef bgra, yuv, priv;
 @property (nonatomic, assign) VTPixelRotationSessionRef rot;
@@ -437,18 +457,14 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
 - (CVPixelBufferRef)pieceAForW:(size_t)w H:(size_t)h fmt:(OSType)fmt {
     if (_pieceA && _pieceAW == w && _pieceAH == h && _pieceFmt == fmt) return _pieceA;
     if (_pieceA) { CVPixelBufferRelease(_pieceA); _pieceA = NULL; }
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, NULL, &_pieceA) != noErr || !_pieceA) {
-        _pieceA = NULL; return NULL;
-    }
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, NULL, &_pieceA) != noErr || !_pieceA) { _pieceA = NULL; return NULL; }
     _pieceAW = w; _pieceAH = h; _pieceFmt = fmt;
     return _pieceA;
 }
 - (CVPixelBufferRef)pieceBForW:(size_t)w H:(size_t)h fmt:(OSType)fmt {
     if (_pieceB && _pieceBW == w && _pieceBH == h && _pieceFmt == fmt) return _pieceB;
     if (_pieceB) { CVPixelBufferRelease(_pieceB); _pieceB = NULL; }
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, NULL, &_pieceB) != noErr || !_pieceB) {
-        _pieceB = NULL; return NULL;
-    }
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, NULL, &_pieceB) != noErr || !_pieceB) { _pieceB = NULL; return NULL; }
     _pieceBW = w; _pieceBH = h; _pieceFmt = fmt;
     return _pieceB;
 }
@@ -456,31 +472,23 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (!input) return NULL;
     if (fabs(_zoom - 1.0) < 0.001 && _panX == 0.0 && _panY == 0.0)
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
-    if (CVPixelBufferGetPlaneCount(input) != 2)
-        return (CVPixelBufferRef)CVPixelBufferRetain(input);
-
+    if (CVPixelBufferGetPlaneCount(input) != 2) return (CVPixelBufferRef)CVPixelBufferRetain(input);
     size_t W = CVPixelBufferGetWidth(input), H = CVPixelBufferGetHeight(input);
     if (W < 16 || H < 16) return (CVPixelBufferRef)CVPixelBufferRetain(input);
     OSType fmt = CVPixelBufferGetPixelFormatType(input);
-
     CVPixelBufferRef canvas = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, W, H, fmt, NULL, &canvas) != noErr || !canvas)
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
-
     vcamCopyAttachments(input, canvas);
-
     double z = _zoom < 0.5 ? 0.5 : (_zoom > 4.0 ? 4.0 : _zoom);
     double ww = W / z, wh = H / z;
     double wx = (W - ww) / 2.0 - _panX * W;
     double wy = (H - wh) / 2.0 - _panY * W;
-
     long sx0 = (long)MAX(wx, 0.0), sy0 = (long)MAX(wy, 0.0);
     long sx1 = (long)MIN(wx + ww, (double)W), sy1 = (long)MIN(wy + wh, (double)H);
     sx0 &= ~1L; sy0 &= ~1L; sx1 &= ~1L; sy1 &= ~1L;
-
     CVPixelBufferLockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferLockBaseAddress(canvas, 0);
-
     int yBlack = (fmt == '420f') ? 0 : 16;
     for (int p = 0; p < 2; p++) {
         uint8_t *b = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(canvas, p);
@@ -490,7 +498,6 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
         uint8_t val = (p == 0) ? yBlack : 128;
         if (b) for (size_t y = 0; y < ph; y++) memset(b + y * bpr, val, pw);
     }
-
     if (sx1 > sx0 && sy1 > sy0) {
         size_t sw = sx1 - sx0, sh = sy1 - sy0;
         double kx = (double)W / ww;
@@ -511,8 +518,7 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
                     size_t drs = CVPixelBufferGetBytesPerRowOfPlane(canvas, p);
                     size_t yDiv = (p == 0) ? 1 : 2;
                     for (size_t y = 0; y < dh / yDiv; y++)
-                        memcpy(db + ((size_t)dy0 / yDiv + y) * drs + dx0,
-                               sb + ((size_t)sy0 / yDiv + y) * srs + sx0, dw);
+                        memcpy(db + ((size_t)dy0 / yDiv + y) * drs + dx0, sb + ((size_t)sy0 / yDiv + y) * srs + sx0, dw);
                 }
             } else {
                 CVPixelBufferRef pieceA = [self pieceAForW:sw H:sh fmt:fmt];
@@ -540,20 +546,14 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
                             size_t drs = CVPixelBufferGetBytesPerRowOfPlane(canvas, p);
                             size_t yDiv = (p == 0) ? 1 : 2;
                             for (size_t y = 0; y < dh / yDiv; y++)
-                                memcpy(db + ((size_t)dy0 / yDiv + y) * drs + dx0,
-                                       sb + y * srs, dw);
+                                memcpy(db + ((size_t)dy0 / yDiv + y) * drs + dx0, sb + y * srs, dw);
                         }
                         CVPixelBufferUnlockBaseAddress(pieceB, kCVPixelBufferLock_ReadOnly);
-                    } else {
-                        vcamLog(@"bake transfer pieceA->pieceB failed");
                     }
-                } else {
-                    vcamLog(@"bake piece buffer create failed");
                 }
             }
         }
     }
-
     CVPixelBufferUnlockBaseAddress(canvas, 0);
     CVPixelBufferUnlockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
     return canvas;
@@ -563,14 +563,12 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     size_t W = CVPixelBufferGetWidth(buf), H = CVPixelBufferGetHeight(buf);
     if (W < 16 || H < 16 || CVPixelBufferGetPlaneCount(buf) != 2) return;
     if ((W & 1) || (H & 1)) return;
-
     uint8_t r = (_lightColor >> 16) & 0xFF;
     uint8_t g = (_lightColor >> 8) & 0xFF;
     uint8_t b = _lightColor & 0xFF;
     uint8_t cy = (uint8_t)((299 * r + 587 * g + 114 * b) / 1000);
     uint8_t cu = (uint8_t)((-169 * r - 331 * g + 500 * b) / 1000 + 128);
     uint8_t cv = (uint8_t)((500 * r - 419 * g - 81 * b) / 1000 + 128);
-
     int cx = (int)((int64_t)_lightX * W / 100);
     int cyy = (int)((int64_t)_lightY * H / 100);
     int minDim = (int)MIN(W, H);
@@ -581,13 +579,11 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     int radiusSq = radius * radius, innerSq = innerR * innerR;
     int feather = radiusSq - innerSq;
     double invA = feather > 0 ? (double)maxAlpha / feather : 0;
-
     uint8_t *yp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 0);
     uint8_t *cp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 1);
     size_t ys = CVPixelBufferGetBytesPerRowOfPlane(buf, 0);
     size_t cs = CVPixelBufferGetBytesPerRowOfPlane(buf, 1);
     if (!yp || !cp) return;
-
     int y0 = MAX(cyy - radius, 0), y1 = MIN(cyy + radius, (int)H);
     for (int y = y0; y < y1; y++) {
         int dy = y - cyy, dySq = dy * dy;
@@ -613,7 +609,6 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
             row[x] = (uint8_t)((row[x] * (256 - a) + cy * a) >> 8);
         }
     }
-
     int bw2 = (int)W / 2, bh2 = (int)H / 2;
     int cx2 = cx / 2, cy2 = cyy / 2;
     int r2 = radius / 2, ir2 = innerR / 2;
@@ -655,17 +650,12 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
 }
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
     if (!s) return NULL;
-    @try {
-        return [self _process:s targetW:tw targetH:th];
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"process exception: %@", e]);
-        return NULL;
-    }
+    @try { return [self _process:s targetW:tw targetH:th]; }
+    @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"process exception: %@", e]); return NULL; }
 }
 - (CVPixelBufferRef)_process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
     (void)tw; (void)th;
     size_t iw = CVPixelBufferGetWidth(s), ih = CVPixelBufferGetHeight(s);
-
     int total = (_sourceRotation + _rotationAngle) % 360;
     if (total < 0) total += 360;
     CVPixelBufferRef rot = s;
@@ -685,13 +675,11 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
             else CVPixelBufferRelease(d);
         }
     }
-
     CVPixelBufferRef use = rot;
     CVPixelBufferRef extra = NULL;
     if (_mirrored) {
-        if (rotOwned) {
-            vcamMirrorRowsInPlace(rot);
-        } else {
+        if (rotOwned) { vcamMirrorRowsInPlace(rot); }
+        else {
             size_t w = CVPixelBufferGetWidth(rot), h = CVPixelBufferGetHeight(rot);
             OSType fmt = CVPixelBufferGetPixelFormatType(rot);
             if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, NULL, &extra) == noErr && extra) {
@@ -725,12 +713,10 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
             }
         }
     }
-
     CVPixelBufferRef baked = [self bakeTransform:use];
     if (extra) CVPixelBufferRelease(extra);
     if (rotOwned) CVPixelBufferRelease(rot);
     if (!baked) return NULL;
-
     if (_lightOn && _lightColor != 0 && CVPixelBufferGetPlaneCount(baked) == 2) {
         size_t bw = CVPixelBufferGetWidth(baked), bh = CVPixelBufferGetHeight(baked);
         if (!(bw & 1) && !(bh & 1)) {
@@ -758,7 +744,6 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
             }
         }
     }
-
     return baked;
 }
 @end
@@ -802,15 +787,12 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
         _lastEn = -1; _lastRot = -1; _lastPaused = -1;
         _lastZoom = -1;
         _lastMirror = NO; _lastLightOn = NO; _lastLightColor = 0;
-        // 对照原源码 VCamCore init：SpringBoard 里 lean 初始化，
-        // 不创建 player/proc（避免 VT session/dlopen 在 SpringBoard 早期卡住，
-        // 导致 [VCCore shared] 不返回，show 永远执行不到）
         BOOL isSB = [[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"];
         if (!isSB) {
             _player = [[VCPlayer alloc] init];
             _proc = [[VCProc alloc] init];
         } else {
-            vcamLog(@"[vcam] VCCore initialized lean in SpringBoard (no decoder/renderer)");
+            vcamLog(@"[vcam] VCCore lean init in SpringBoard");
         }
     }
     return self;
@@ -835,7 +817,7 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     dispatch_resume(_timer);
 }
 - (void)poll {
-    if (!_isMsd) return;   // SpringBoard 里不解码不渲染，只负责 UI 写 plist
+    if (!_isMsd) return;
     @try {
         NSDictionary *pl = plRead();
         NSInteger en = [pl[@"enabled"] boolValue] ? 1 : 0;
@@ -859,23 +841,18 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
         if (lf < 0 || lf > 100) lf = 100;
         BOOL paused = [pl[@"paused"] boolValue];
         NSString *path = [pl[@"activePlaybackPath"] isKindOfClass:[NSString class]] ? pl[@"activePlaybackPath"] : nil;
-
         BOOL enChanged = (en != _lastEn);
         BOOL rotChanged = (rot != _lastRot);
         BOOL mirrorChanged = (mirror != _lastMirror);
         BOOL panChanged = (px != _lastPanX || py != _lastPanY || z != _lastZoom);
         BOOL lightChanged = (lon != _lastLightOn || lc != _lastLightColor ||
                              lx != _lastLX || ly != _lastLY || li != _lastLI || ld != _lastLD || lf != _lastLF);
-
         if (enChanged || rotChanged || mirrorChanged || panChanged || lightChanged) {
             [_renderLock lock];
             if (enChanged) { _lastEn = en; _enabled = (en == 1); }
             if (rotChanged) { _lastRot = rot; _proc.rotationAngle = (int)(rot % 360); }
             if (mirrorChanged) { _lastMirror = mirror; _proc.mirrored = mirror; }
-            if (panChanged) {
-                _lastPanX = px; _lastPanY = py; _lastZoom = z;
-                _proc.panX = px; _proc.panY = py; _proc.zoom = z;
-            }
+            if (panChanged) { _lastPanX = px; _lastPanY = py; _lastZoom = z; _proc.panX = px; _proc.panY = py; _proc.zoom = z; }
             if (lightChanged) {
                 _lastLightOn = lon; _lastLightColor = lc;
                 _lastLX = lx; _lastLY = ly; _lastLI = li; _lastLD = ld; _lastLF = lf;
@@ -885,21 +862,15 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
             }
             [_renderLock unlock];
         }
-
         if (enChanged && _enabled) [_player start];
         if (path && ![path isEqualToString:_player.path]) [_player load:path];
         if (paused != _lastPaused) { _lastPaused = paused; _player.paused = paused; }
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"poll exception: %@", e]);
-    }
+    } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"poll exception: %@", e]); }
 }
 - (void)renderInto:(CVPixelBufferRef)pb pts:(double)pts {
     if (!_enabled || !pb) return;
-    @try {
-        [self _renderInto:pb pts:pts];
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"renderInto exception: %@", e]);
-    }
+    @try { [self _renderInto:pb pts:pts]; }
+    @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"renderInto exception: %@", e]); }
 }
 - (void)_renderInto:(CVPixelBufferRef)pb pts:(double)pts {
     [_dedupLock lock];
@@ -910,32 +881,27 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     _dedupBuf = pb; _dedupTime = now;
     [_dedupLock unlock];
     if (dup) return;
-
     size_t tw = CVPixelBufferGetWidth(pb), th = CVPixelBufferGetHeight(pb);
     [_renderLock lock];
     CVPixelBufferRef frame = [_player.queue pop];
     if (!frame) frame = [_player.queue copyCurrent];
     if (!frame) frame = _fallback ? CVPixelBufferRetain(_fallback) : NULL;
     if (!frame) { [_renderLock unlock]; return; }
-
     _proc.sourceRotation = _player.preferredRotation;
     CVPixelBufferRef out = [_proc process:frame targetW:tw targetH:th];
     CVPixelBufferRelease(frame);
-
     if (out) {
         if ([_proc transfer:out to:pb]) {
             if (_fallback) CVPixelBufferRelease(_fallback);
             _fallback = CVPixelBufferRetain(out);
-        } else {
-            vcamLog(@"write failed, keep camera");
-        }
+        } else { vcamLog(@"write failed, keep camera"); }
         CVPixelBufferRelease(out);
     }
     [_renderLock unlock];
 }
 @end
 
-// ======================= Hook（主预览 + 照片流） =======================
+// ======================= Hook =======================
 static void (*origEmit)(id, SEL, CMSampleBufferRef);
 static void (*origScaler)(id, SEL, CMSampleBufferRef, id);
 static void (*origEncoder)(id, SEL, CMSampleBufferRef, id);
@@ -954,29 +920,18 @@ static void processSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
             @try {
                 double pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
                 [[VCCore shared] renderInto:pb pts:pts];
-            } @catch (NSException *e) {
-                vcamLog([NSString stringWithFormat:@"render call exception: %@", e]);
-            }
+            } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"render call exception: %@", e]); }
         }
     }
 }
 static void hookEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
-    @autoreleasepool {
-        processSampleBuffer(self, _cmd, sb);
-        if (origEmit) origEmit(self, _cmd, sb);
-    }
+    @autoreleasepool { processSampleBuffer(self, _cmd, sb); if (origEmit) origEmit(self, _cmd, sb); }
 }
 static void hookScaler(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
-    @autoreleasepool {
-        processSampleBuffer(self, _cmd, sb);
-        if (origScaler) origScaler(self, _cmd, sb, input);
-    }
+    @autoreleasepool { processSampleBuffer(self, _cmd, sb); if (origScaler) origScaler(self, _cmd, sb, input); }
 }
 static void hookEncoder(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
-    @autoreleasepool {
-        processSampleBuffer(self, _cmd, sb);
-        if (origEncoder) origEncoder(self, _cmd, sb, input);
-    }
+    @autoreleasepool { processSampleBuffer(self, _cmd, sb); if (origEncoder) origEncoder(self, _cmd, sb, input); }
 }
 static void installHooks(void) {
     @try {
@@ -986,17 +941,10 @@ static void installHooks(void) {
             if (m) {
                 origEmit = (void (*)(id, SEL, CMSampleBufferRef))method_getImplementation(m);
                 method_setImplementation(m, (IMP)hookEmit);
-                vcamLog(@"Hooked BWNodeOutput emitSampleBuffer:");
-            } else {
-                vcamLog(@"BWNodeOutput emitSampleBuffer: not found");
+                vcamLog(@"Hooked BWNodeOutput");
             }
-        } else {
-            vcamLog(@"BWNodeOutput class not found");
         }
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"hook BWNodeOutput exception: %@", e]);
-    }
-
+    } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"hook emit exception: %@", e]); }
     @try {
         Class c2 = objc_getClass("BWStillImageScalerNode");
         if (c2) {
@@ -1007,10 +955,7 @@ static void installHooks(void) {
                 vcamLog(@"Hooked BWStillImageScalerNode");
             }
         }
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"hook Scaler exception: %@", e]);
-    }
-
+    } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"hook scaler exception: %@", e]); }
     @try {
         Class c3 = objc_getClass("BWPhotoEncoderNode");
         if (c3) {
@@ -1021,21 +966,24 @@ static void installHooks(void) {
                 vcamLog(@"Hooked BWPhotoEncoderNode");
             }
         }
-    } @catch (NSException *e) {
-        vcamLog([NSString stringWithFormat:@"hook Encoder exception: %@", e]);
-    }
+    } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"hook encoder exception: %@", e]); }
 }
 
 // ======================= 复古仪表盘 UI =======================
-// 悬浮球专用日志：无条件写（不受 logEnabled 控制），对照原源码 vcam_ball_log
+// 悬浮球无条件日志（多路径）
 static void vcamBallLog(NSString *m) {
-    @try {
-        NSString *p = @"/tmp/vcam_ball_log.txt";
-        NSString *e = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-        if (!fh) [e writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        else { [fh seekToEndOfFile]; [fh writeData:[e dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-    } @catch (NSException *e) {}
+    NSArray *paths = @[@"/tmp/vcam_ball_log.txt",
+                       @"/private/tmp/vcam_ball_log.txt",
+                       @"/var/tmp/vcam_ball_log.txt",
+                       @"/var/mobile/Media/DCIM/vcam_ball_log.txt"];
+    NSString *e = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+    for (NSString *p in paths) {
+        @try {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (!fh) [e writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            else { [fh seekToEndOfFile]; [fh writeData:[e dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        } @catch (NSException *e) {}
+    }
 }
 
 static UIColor *CGold(void)   { return [UIColor colorWithRed:0.83 green:0.69 blue:0.42 alpha:1.0]; }
@@ -1123,6 +1071,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 @property (nonatomic, strong) NSMutableArray<UILabel *> *sliderValueLabels;
 @property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
 @property (nonatomic, assign) BOOL visible, floating, paused, lightPageActive;
+@property (nonatomic, assign) int buildRetries;
 + (instancetype)shared;
 - (void)show;
 - (void)hide;
@@ -1139,11 +1088,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)show {
     if (_floating) return;
     _floating = YES;
-    vcamBallLog(@"[vcam] VCBall show called");
-    dispatch_async(dispatch_get_main_queue(), ^{
-        vcamBallLog(@"[vcam] VCBall build on main queue");
-        [self build];
-    });
+    vcamBallLog(@"[vcam] VCBall show");
+    dispatch_async(dispatch_get_main_queue(), ^{ [self build]; });
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didActive) name:UIApplicationDidBecomeActiveNotification object:nil];
 }
 - (void)hide {
@@ -1151,11 +1097,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.win removeFromSuperview];
         self.win.hidden = YES;
-        self.win = nil;
-        self.ball = nil;
-        self.panel = nil;
-        self.ctrlPage = nil;
-        self.lightPage = nil;
+        self.win = nil; self.ball = nil; self.panel = nil;
+        self.ctrlPage = nil; self.lightPage = nil;
     });
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
@@ -1163,7 +1106,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     vcamBallLog(@"[vcam] VCBall didActive");
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self->_floating && self.win && self.win.windowScene == nil) {
-            vcamBallLog(@"[vcam] VCBall window has no scene, recreating");
+            vcamBallLog(@"[vcam] VCBall window no scene, recreating");
             [self.win removeFromSuperview];
             self.win = nil;
             [self build];
@@ -1171,16 +1114,24 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     });
 }
 - (void)build {
-    vcamBallLog(@"[vcam] VCBall build begin");
-    @try {
-        [self _build];
-        vcamBallLog(@"[vcam] VCBall build done");
-    } @catch (NSException *e) {
-        vcamBallLog([NSString stringWithFormat:@"[vcam] VCBall build exception: %@", e]);
-    }
+    @try { [self _build]; }
+    @catch (NSException *e) { vcamBallLog([NSString stringWithFormat:@"[vcam] build exception: %@", e]); }
 }
 - (void)_build {
     CGRect sb = [UIScreen mainScreen].bounds;
+    if (sb.size.width < 100 || sb.size.height < 100) {
+        vcamBallLog([NSString stringWithFormat:@"[vcam] bounds invalid %@, retry", NSStringFromCGRect(sb)]);
+        if (_buildRetries < 20) {
+            _buildRetries++;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (self->_floating) [self build];
+            });
+        }
+        return;
+    }
+    vcamBallLog([NSString stringWithFormat:@"[vcam] build begin, bounds=%@", NSStringFromCGRect(sb)]);
+    _buildRetries = 0;
+
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
@@ -1188,8 +1139,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     if (!scene) for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
     }
-    if (scene) _win = [[VCOverlayWindow alloc] initWithWindowScene:scene];
-    else _win = [[VCOverlayWindow alloc] initWithFrame:sb];
+    if (scene) {
+        _win = [[VCOverlayWindow alloc] initWithWindowScene:scene];
+        vcamBallLog(@"[vcam] window initWithWindowScene");
+    } else {
+        _win = [[VCOverlayWindow alloc] initWithFrame:sb];
+        vcamBallLog(@"[vcam] window initWithFrame (no scene)");
+    }
     _win.frame = sb;
     _win.windowLevel = UIWindowLevelAlert + 100;
     _win.backgroundColor = [UIColor clearColor];
@@ -1206,7 +1162,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 
     [self buildPanel];
     [_win addSubview:_ball];
-    vcamBallLog([NSString stringWithFormat:@"[vcam] VCBall added to window, bounds=%@", NSStringFromCGRect(sb)]);
+    vcamBallLog([NSString stringWithFormat:@"[vcam] build done, ball at %.0f,%.0f", bx, by]);
 }
 - (void)buildPanel {
     CGFloat pw = 250, ph = 400, pad = 12;
@@ -1221,36 +1177,29 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _panel.layer.shadowRadius = 0;
     _panel.hidden = YES;
     _panel.alpha = 0;
-
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(pad, 8, pw - pad * 2, 26)];
     title.text = @"V C A M · P L U S";
     title.textColor = CGold();
     title.font = [UIFont fontWithName:@"Courier New-Bold" size:14] ?: [UIFont boldSystemFontOfSize:14];
     title.textAlignment = NSTextAlignmentCenter;
     [_panel addSubview:title];
-
     UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(pad, 38, pw - pad * 2, 1)];
     sep.backgroundColor = CGoldDk();
     [_panel addSubview:sep];
-
     CGFloat tabY = 46, tabH = 26, contentW = pw - pad * 2;
     CGFloat tabW = (contentW - 6) / 2;
     _tabCtrlBtn = makeRetroBtn(@"控制", CGRectMake(pad, tabY, tabW, tabH), self, @selector(switchCtrlTab));
     _tabLightBtn = makeRetroBtn(@"打光", CGRectMake(pad + tabW + 6, tabY, tabW, tabH), self, @selector(switchLightTab));
     [_panel addSubview:_tabCtrlBtn]; [_panel addSubview:_tabLightBtn];
-
     CGFloat pageY = tabY + tabH + 6;
     CGFloat pageH = ph - pageY - pad;
-
     _ctrlPage = [[UIView alloc] initWithFrame:CGRectMake(0, pageY, pw, pageH)];
     [self buildCtrlPage:_ctrlPage width:pw pad:pad contentW:contentW pageH:pageH];
     [_panel addSubview:_ctrlPage];
-
     _lightPage = [[UIView alloc] initWithFrame:CGRectMake(0, pageY, pw, pageH)];
     [self buildLightPage:_lightPage width:pw pad:pad contentW:contentW pageH:pageH];
     _lightPage.hidden = YES;
     [_panel addSubview:_lightPage];
-
     [self refreshVisuals];
     [_win addSubview:_panel];
 }
@@ -1259,12 +1208,10 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [page addSubview:makeRetroBtn(@"选择视频", CGRectMake(pad, y, contentW, btnH), self, @selector(pickVideo))]; y += btnH + gap;
     _replaceBtn = makeRetroBtn(@"替 换 · ON", CGRectMake(pad, y, contentW, btnH), self, @selector(toggleReplace));
     [page addSubview:_replaceBtn]; y += btnH + gap;
-
     CGFloat halfW = (contentW - gap) / 2;
     [page addSubview:makeIconBtn(@"arrow.clockwise", CGRectMake(pad, y, halfW, btnH), self, @selector(rotate))];
     _playBtn = makeIconBtn(@"pause.fill", CGRectMake(pad + halfW + gap, y, halfW, btnH), self, @selector(togglePause));
     [page addSubview:_playBtn]; y += btnH + gap;
-
     CGFloat dpadH = 72, kw = (contentW - gap * 2) / 3;
     UIButton *up = makeIconBtn(@"arrow.up",    CGRectMake(pad + kw + gap, y, kw, (dpadH - gap) / 2), self, @selector(panUp));
     UIButton *dn = makeIconBtn(@"arrow.down",  CGRectMake(pad + kw + gap, y + (dpadH + gap) / 2, kw, (dpadH - gap) / 2), self, @selector(panDown));
@@ -1273,13 +1220,11 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     UIButton *rs = makeRetroBtn(@"复",         CGRectMake(pad + kw + gap, y + (dpadH - gap) / 4, kw, dpadH / 2), self, @selector(resetTransform));
     [page addSubview:up]; [page addSubview:dn]; [page addSubview:lf]; [page addSubview:rt]; [page addSubview:rs];
     y += dpadH + gap;
-
     CGFloat thirdW = (contentW - gap * 2) / 3;
     [page addSubview:makeIconBtn(@"minus", CGRectMake(pad, y, thirdW, btnH), self, @selector(zoomOut))];
     [page addSubview:makeIconBtn(@"plus",  CGRectMake(pad + thirdW + gap, y, thirdW, btnH), self, @selector(zoomIn))];
     _mirrorBtn = makeIconBtn(@"arrow.left.and.right.righttriangle.left.righttriangle.right", CGRectMake(pad + (thirdW + gap) * 2, y, thirdW, btnH), self, @selector(toggleMirror));
     [page addSubview:_mirrorBtn]; y += btnH + gap;
-
     _lightBtn = makeRetroBtn(@"彩色注入 · OFF", CGRectMake(pad, y, contentW, btnH), self, @selector(toggleLight));
     [page addSubview:_lightBtn];
 }
@@ -1287,7 +1232,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _colorBtns = [NSMutableArray array];
     _sliders = [NSMutableArray array];
     _sliderValueLabels = [NSMutableArray array];
-
     CGFloat y = 4;
     uint32_t colors[6] = {0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF};
     NSString *names[6] = {@"红", @"绿", @"蓝", @"黄", @"青", @"紫"};
@@ -1312,7 +1256,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         [_colorBtns addObject:b];
     }
     y += dotSize + 6;
-
     NSString *titles[5] = {@"强度", @"直径", @"X", @"Y", @"羽化"};
     NSString *keys[5] = {@"lightIntensity", @"lightDiameter", @"lightX", @"lightY", @"lightFeather"};
     int defaults[5] = {30, 48, 50, 50, 100};
@@ -1323,16 +1266,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     CGFloat sliderW = contentW - 44 - valueW - 6;
     for (int i = 0; i < 5; i++) {
         CGFloat ry = y + i * (rowH + rowGap);
-
         UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(pad, ry + 5, 44, 20)];
         t.text = titles[i];
         t.textColor = CGold();
         t.font = [UIFont fontWithName:@"Courier New" size:12] ?: [UIFont systemFontOfSize:12];
         [page addSubview:t];
-
         UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, ry, sliderW, 30)];
-        s.minimumValue = 0;
-        s.maximumValue = 100;
+        s.minimumValue = 0; s.maximumValue = 100;
         NSNumber *val = pl[keys[i]];
         int v = val ? [val intValue] : defaults[i];
         if (v < 0) v = 0; if (v > 100) v = 100;
@@ -1345,7 +1285,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         [s addTarget:self action:@selector(sliderCommit:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
         [page addSubview:s];
         [_sliders addObject:s];
-
         UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - valueW, ry + 5, valueW, 20)];
         vl.text = [NSString stringWithFormat:@"%d", v];
         vl.textColor = CGreen();
@@ -1357,14 +1296,12 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 }
 - (void)switchCtrlTab {
     _lightPageActive = NO;
-    _ctrlPage.hidden = NO;
-    _lightPage.hidden = YES;
+    _ctrlPage.hidden = NO; _lightPage.hidden = YES;
     [self refreshTabStyles];
 }
 - (void)switchLightTab {
     _lightPageActive = YES;
-    _ctrlPage.hidden = YES;
-    _lightPage.hidden = NO;
+    _ctrlPage.hidden = YES; _lightPage.hidden = NO;
     [self refreshTabStyles];
 }
 - (void)refreshTabStyles {
@@ -1394,8 +1331,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)ballTap {
     _visible = !_visible;
     if (_visible) {
-        [self layoutPanel];
-        _panel.hidden = NO;
+        [self layoutPanel]; _panel.hidden = NO;
         [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 1; }];
     } else {
         [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 0; } completion:^(BOOL f){ _panel.hidden = YES; }];
@@ -1428,16 +1364,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _replaceBtn.backgroundColor = en ? CGold() : CDeep();
     [_replaceBtn setTitleColor:(en ? CDeep() : CGreen()) forState:UIControlStateNormal];
     _replaceBtn.layer.borderColor = en ? CDeep().CGColor : CGoldDk().CGColor;
-
     BOOL mi = [pl[@"mirrored"] boolValue];
     _mirrorBtn.backgroundColor = mi ? CGoldDk() : CGold();
     _mirrorBtn.tintColor = mi ? CGreen() : CDeep();
-
     BOOL lon = [pl[@"lightEnabled"] boolValue];
     [_lightBtn setTitle:(lon ? @"彩色注入 · ON" : @"彩色注入 · OFF") forState:UIControlStateNormal];
     _lightBtn.backgroundColor = lon ? CGold() : CDeep();
     [_lightBtn setTitleColor:(lon ? CDeep() : CGreen()) forState:UIControlStateNormal];
-
     _paused = [pl[@"paused"] boolValue];
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightBold];
     UIImage *img = [UIImage systemImageNamed:(_paused ? @"play.fill" : @"pause.fill") withConfiguration:cfg];
@@ -1489,9 +1422,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
                 [self refreshVisuals];
                 [self toast:@"视频已载入"];
             });
-        } else {
-            [self toast:@"复制失败"];
-        }
+        } else { [self toast:@"复制失败"]; }
     }];
 }
 - (void)toggleReplace {
@@ -1547,9 +1478,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         uint32_t c = (uint32_t)[plRead()[@"lightColor"] unsignedIntValue];
         if (c == 0) plSetMany(@{@"lightEnabled": @YES, @"lightColor": @(0xFF0000)});
         else plSet(@"lightEnabled", @YES);
-    } else {
-        plSet(@"lightEnabled", @NO);
-    }
+    } else { plSet(@"lightEnabled", @NO); }
     [self refreshVisuals];
     [self toast:(on ? @"彩色注入关" : @"彩色注入开")];
 }
@@ -1576,7 +1505,9 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 __attribute__((constructor))
 static void vcamInit(void) {
     @autoreleasepool {
+        if (vcamLoadedViaOtherPath()) return;
         NSString *name = [[NSProcessInfo processInfo] processName];
+        vcamLoadBeacon(name);
         vcamLog([NSString stringWithFormat:@"[vcam] loaded in %@", name]);
         vcamBallLog([NSString stringWithFormat:@"[vcam] loaded in %@", name]);
         if ([name isEqualToString:@"mediaserverd"]) {
