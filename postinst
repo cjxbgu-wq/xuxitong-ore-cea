@@ -1,10 +1,47 @@
 #!/bin/sh
-set -e
+set +e
 JBROOT=$(/usr/bin/jbroot 2>/dev/null || echo "/")
-DY="$JBROOT/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
-if [ -f "$DY" ]; then
-    /usr/bin/jb_ctl trustcache add "$DY" 2>/dev/null || \
-    /usr/bin/jbctl trustcache add "$DY" 2>/dev/null || true
+
+# 自动初始化 vc.plist（不存在时创建，不覆盖已有）
+VC_PLIST="/var/mobile/Media/DCIM/vc.plist"
+if [ ! -f "$VC_PLIST" ]; then
+    mkdir -p /var/mobile/Media/DCIM 2>/dev/null || true
+    cat > "$VC_PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>enabled</key><false/>
+    <key>activePlaybackPath</key><string>/var/mobile/Media/DCIM/vcam.mp4</string>
+    <key>manualRotation</key><integer>0</integer>
+    <key>paused</key><false/>
+    <key>mirrored</key><false/>
+    <key>userPanX</key><real>0.0</real>
+    <key>userPanY</key><real>0.0</real>
+    <key>userZoom</key><real>1.0</real>
+    <key>lightEnabled</key><false/>
+    <key>lightColor</key><integer>0</integer>
+    <key>lightX</key><integer>50</integer>
+    <key>lightY</key><integer>50</integer>
+    <key>lightIntensity</key><integer>30</integer>
+    <key>lightDiameter</key><integer>48</integer>
+    <key>lightFeather</key><integer>100</integer>
+    <key>logEnabled</key><true/>
+</dict>
+</plist>
+EOF
+    chmod 0644 "$VC_PLIST" 2>/dev/null || true
+    chown mobile:mobile "$VC_PLIST" 2>/dev/null || true
 fi
+
+# trustcache 注册
+for DY in "$JBROOT/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib" \
+          "$JBROOT/usr/lib/TweakInject/VCamPlus.dylib"; do
+    if [ -f "$DY" ]; then
+        /usr/bin/jb_ctl trustcache add "$DY" 2>/dev/null || \
+        /usr/bin/jbctl trustcache add "$DY" 2>/dev/null || true
+    fi
+done
+
 killall -9 SpringBoard 2>/dev/null || true
 exit 0
