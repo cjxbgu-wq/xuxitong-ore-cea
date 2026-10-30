@@ -115,7 +115,7 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
 }
 @end
 
-// ======================= 视频解码器（PTS 帧率校准） =======================
+// ======================= 视频解码器 =======================
 @interface VCPlayer : NSObject
 @property (nonatomic, strong) AVURLAsset *asset;
 @property (nonatomic, strong) AVAssetTrack *track;
@@ -163,45 +163,53 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
 - (void)stop { _shouldRun = NO; }
 
 - (void)rebuild {
-    if (_reader) { [_reader cancelReading]; _reader = nil; }
-    _output = nil; [_queue clear];
-    if (!_asset || !_track) return;
-    NSError *err = nil;
-    _reader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
-    if (err || !_reader) return;
-    NSDictionary *s = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
-        (id)kCVPixelBufferWidthKey: @(_w),
-        (id)kCVPixelBufferHeightKey: @(_h),
-    };
-    _output = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_track outputSettings:s];
-    _output.alwaysCopiesSampleData = NO;
-    if (![_reader canAddOutput:_output]) { _reader = nil; _output = nil; return; }
-    [_reader addOutput:_output];
-    if (![_reader startReading]) { [_reader cancelReading]; _reader = nil; _output = nil; return; }
-    for (int i = 0; i < 5; i++) {
-        CVPixelBufferRef b = [self read];
-        if (!b) break;
-        [_queue push:b]; CVPixelBufferRelease(b);
+    @try {
+        if (_reader) { [_reader cancelReading]; _reader = nil; }
+        _output = nil; [_queue clear];
+        if (!_asset || !_track) return;
+        NSError *err = nil;
+        _reader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
+        if (err || !_reader) return;
+        NSDictionary *s = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
+            (id)kCVPixelBufferWidthKey: @(_w),
+            (id)kCVPixelBufferHeightKey: @(_h),
+        };
+        _output = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_track outputSettings:s];
+        _output.alwaysCopiesSampleData = NO;
+        if (![_reader canAddOutput:_output]) { _reader = nil; _output = nil; return; }
+        [_reader addOutput:_output];
+        if (![_reader startReading]) { [_reader cancelReading]; _reader = nil; _output = nil; return; }
+        for (int i = 0; i < 5; i++) {
+            CVPixelBufferRef b = [self read];
+            if (!b) break;
+            [_queue push:b]; CVPixelBufferRelease(b);
+        }
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"rebuild exception: %@", e]);
     }
 }
 - (void)restartReader {
-    if (_reader) { [_reader cancelReading]; _reader = nil; }
-    _output = nil;
-    if (!_asset || !_track) return;
-    NSError *err = nil;
-    _reader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
-    if (err || !_reader) { _reader = nil; return; }
-    NSDictionary *s = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
-        (id)kCVPixelBufferWidthKey: @(_w),
-        (id)kCVPixelBufferHeightKey: @(_h),
-    };
-    _output = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_track outputSettings:s];
-    _output.alwaysCopiesSampleData = NO;
-    if (![_reader canAddOutput:_output]) { _reader = nil; _output = nil; return; }
-    [_reader addOutput:_output];
-    if (![_reader startReading]) { [_reader cancelReading]; _reader = nil; _output = nil; }
+    @try {
+        if (_reader) { [_reader cancelReading]; _reader = nil; }
+        _output = nil;
+        if (!_asset || !_track) return;
+        NSError *err = nil;
+        _reader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
+        if (err || !_reader) { _reader = nil; return; }
+        NSDictionary *s = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
+            (id)kCVPixelBufferWidthKey: @(_w),
+            (id)kCVPixelBufferHeightKey: @(_h),
+        };
+        _output = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_track outputSettings:s];
+        _output.alwaysCopiesSampleData = NO;
+        if (![_reader canAddOutput:_output]) { _reader = nil; _output = nil; return; }
+        [_reader addOutput:_output];
+        if (![_reader startReading]) { [_reader cancelReading]; _reader = nil; _output = nil; }
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"restartReader exception: %@", e]);
+    }
 }
 - (CVPixelBufferRef)read CF_RETURNS_RETAINED {
     if (!_output || _reader.status != AVAssetReaderStatusReading) return NULL;
@@ -226,33 +234,42 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
     return pb;
 }
 - (void)applyPath:(NSString *)p {
-    _asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:p]
-                                 options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
-    NSArray *t = [_asset tracksWithMediaType:AVMediaTypeVideo];
-    if (t.count == 0) {
-        vcamLog(@"no video track, clean up");
+    @try {
+        _asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:p]
+                                     options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
+        NSArray *t = [_asset tracksWithMediaType:AVMediaTypeVideo];
+        if (!t || t.count == 0) {
+            vcamLog(@"no video track, clean up");
+            if (_reader) { [_reader cancelReading]; _reader = nil; }
+            _output = nil;
+            _track = nil;
+            _failedPath = [p copy];
+            _failedAt = CFAbsoluteTimeGetCurrent();
+            return;
+        }
+        _path = [p copy];
+        _failedPath = nil;
+        _track = t[0];
+        _w = (size_t)_track.naturalSize.width;
+        _h = (size_t)_track.naturalSize.height;
+        _fps = _track.nominalFrameRate > 1 ? _track.nominalFrameRate : 30.0;
+        _effFps = 0;
+        _hasLastPTS = NO;
+        _lastPTS = 0;
+        CGAffineTransform pt = _track.preferredTransform;
+        if (pt.a == 0 && pt.b == 1 && pt.c == -1 && pt.d == 0) _preferredRotation = 90;
+        else if (pt.a == -1 && pt.b == 0 && pt.c == 0 && pt.d == -1) _preferredRotation = 180;
+        else if (pt.a == 0 && pt.b == -1 && pt.c == 1 && pt.d == 0) _preferredRotation = 270;
+        else _preferredRotation = 0;
+        [self rebuild];
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"applyPath exception: %@", e]);
         if (_reader) { [_reader cancelReading]; _reader = nil; }
         _output = nil;
         _track = nil;
         _failedPath = [p copy];
         _failedAt = CFAbsoluteTimeGetCurrent();
-        return;
     }
-    _path = [p copy];
-    _failedPath = nil;
-    _track = t[0];
-    _w = (size_t)_track.naturalSize.width;
-    _h = (size_t)_track.naturalSize.height;
-    _fps = _track.nominalFrameRate > 1 ? _track.nominalFrameRate : 30.0;
-    _effFps = 0;
-    _hasLastPTS = NO;
-    _lastPTS = 0;
-    CGAffineTransform pt = _track.preferredTransform;
-    if (pt.a == 0 && pt.b == 1 && pt.c == -1 && pt.d == 0) _preferredRotation = 90;
-    else if (pt.a == -1 && pt.b == 0 && pt.c == 0 && pt.d == -1) _preferredRotation = 180;
-    else if (pt.a == 0 && pt.b == -1 && pt.c == 1 && pt.d == 0) _preferredRotation = 270;
-    else _preferredRotation = 0;
-    [self rebuild];
 }
 - (void)loop {
     @autoreleasepool {
@@ -367,6 +384,7 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
 - (instancetype)init;
 - (BOOL)transfer:(CVPixelBufferRef)s to:(CVPixelBufferRef)d;
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED;
+- (CVPixelBufferRef)_process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED;
 @end
 
 @implementation VCProc
@@ -637,6 +655,14 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
 }
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
     if (!s) return NULL;
+    @try {
+        return [self _process:s targetW:tw targetH:th];
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"process exception: %@", e]);
+        return NULL;
+    }
+}
+- (CVPixelBufferRef)_process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
     (void)tw; (void)th;
     size_t iw = CVPixelBufferGetWidth(s), ih = CVPixelBufferGetHeight(s);
 
@@ -759,6 +785,7 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
 - (void)startRender;
 - (void)startPolling;
 - (void)renderInto:(CVPixelBufferRef)pb pts:(double)pts;
+- (void)_renderInto:(CVPixelBufferRef)pb pts:(double)pts;
 @end
 
 @implementation VCCore
@@ -800,61 +827,72 @@ static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
     dispatch_resume(_timer);
 }
 - (void)poll {
-    NSDictionary *pl = plRead();
-    NSInteger en = [pl[@"enabled"] boolValue] ? 1 : 0;
-    NSInteger rot = [pl[@"manualRotation"] integerValue];
-    BOOL mirror = [pl[@"mirrored"] boolValue];
-    double px = [pl[@"userPanX"] doubleValue];
-    double py = [pl[@"userPanY"] doubleValue];
-    double z = [pl[@"userZoom"] doubleValue];
-    if (z <= 0) z = 1.0;
-    BOOL lon = [pl[@"lightEnabled"] boolValue];
-    uint32_t lc = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-    int lx = pl[@"lightX"] ? [pl[@"lightX"] intValue] : 50;
-    int ly = pl[@"lightY"] ? [pl[@"lightY"] intValue] : 50;
-    int li = pl[@"lightIntensity"] ? [pl[@"lightIntensity"] intValue] : 30;
-    int ld = pl[@"lightDiameter"] ? [pl[@"lightDiameter"] intValue] : 48;
-    int lf = pl[@"lightFeather"] ? [pl[@"lightFeather"] intValue] : 100;
-    if (lx <= 0 || lx > 100) lx = 50;
-    if (ly <= 0 || ly > 100) ly = 50;
-    if (li < 0 || li > 100) li = 30;
-    if (ld <= 0 || ld > 100) ld = 48;
-    if (lf < 0 || lf > 100) lf = 100;
-    BOOL paused = [pl[@"paused"] boolValue];
-    NSString *path = [pl[@"activePlaybackPath"] isKindOfClass:[NSString class]] ? pl[@"activePlaybackPath"] : nil;
+    @try {
+        NSDictionary *pl = plRead();
+        NSInteger en = [pl[@"enabled"] boolValue] ? 1 : 0;
+        NSInteger rot = [pl[@"manualRotation"] integerValue];
+        BOOL mirror = [pl[@"mirrored"] boolValue];
+        double px = [pl[@"userPanX"] doubleValue];
+        double py = [pl[@"userPanY"] doubleValue];
+        double z = [pl[@"userZoom"] doubleValue];
+        if (z <= 0) z = 1.0;
+        BOOL lon = [pl[@"lightEnabled"] boolValue];
+        uint32_t lc = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
+        int lx = pl[@"lightX"] ? [pl[@"lightX"] intValue] : 50;
+        int ly = pl[@"lightY"] ? [pl[@"lightY"] intValue] : 50;
+        int li = pl[@"lightIntensity"] ? [pl[@"lightIntensity"] intValue] : 30;
+        int ld = pl[@"lightDiameter"] ? [pl[@"lightDiameter"] intValue] : 48;
+        int lf = pl[@"lightFeather"] ? [pl[@"lightFeather"] intValue] : 100;
+        if (lx <= 0 || lx > 100) lx = 50;
+        if (ly <= 0 || ly > 100) ly = 50;
+        if (li < 0 || li > 100) li = 30;
+        if (ld <= 0 || ld > 100) ld = 48;
+        if (lf < 0 || lf > 100) lf = 100;
+        BOOL paused = [pl[@"paused"] boolValue];
+        NSString *path = [pl[@"activePlaybackPath"] isKindOfClass:[NSString class]] ? pl[@"activePlaybackPath"] : nil;
 
-    BOOL enChanged = (en != _lastEn);
-    BOOL rotChanged = (rot != _lastRot);
-    BOOL mirrorChanged = (mirror != _lastMirror);
-    BOOL panChanged = (px != _lastPanX || py != _lastPanY || z != _lastZoom);
-    BOOL lightChanged = (lon != _lastLightOn || lc != _lastLightColor ||
-                         lx != _lastLX || ly != _lastLY || li != _lastLI || ld != _lastLD || lf != _lastLF);
+        BOOL enChanged = (en != _lastEn);
+        BOOL rotChanged = (rot != _lastRot);
+        BOOL mirrorChanged = (mirror != _lastMirror);
+        BOOL panChanged = (px != _lastPanX || py != _lastPanY || z != _lastZoom);
+        BOOL lightChanged = (lon != _lastLightOn || lc != _lastLightColor ||
+                             lx != _lastLX || ly != _lastLY || li != _lastLI || ld != _lastLD || lf != _lastLF);
 
-    if (enChanged || rotChanged || mirrorChanged || panChanged || lightChanged) {
-        [_renderLock lock];
-        if (enChanged) { _lastEn = en; _enabled = (en == 1); }
-        if (rotChanged) { _lastRot = rot; _proc.rotationAngle = (int)(rot % 360); }
-        if (mirrorChanged) { _lastMirror = mirror; _proc.mirrored = mirror; }
-        if (panChanged) {
-            _lastPanX = px; _lastPanY = py; _lastZoom = z;
-            _proc.panX = px; _proc.panY = py; _proc.zoom = z;
+        if (enChanged || rotChanged || mirrorChanged || panChanged || lightChanged) {
+            [_renderLock lock];
+            if (enChanged) { _lastEn = en; _enabled = (en == 1); }
+            if (rotChanged) { _lastRot = rot; _proc.rotationAngle = (int)(rot % 360); }
+            if (mirrorChanged) { _lastMirror = mirror; _proc.mirrored = mirror; }
+            if (panChanged) {
+                _lastPanX = px; _lastPanY = py; _lastZoom = z;
+                _proc.panX = px; _proc.panY = py; _proc.zoom = z;
+            }
+            if (lightChanged) {
+                _lastLightOn = lon; _lastLightColor = lc;
+                _lastLX = lx; _lastLY = ly; _lastLI = li; _lastLD = ld; _lastLF = lf;
+                _proc.lightOn = lon; _proc.lightColor = lc;
+                _proc.lightX = lx; _proc.lightY = ly;
+                _proc.lightInt = li; _proc.lightDia = ld; _proc.lightFea = lf;
+            }
+            [_renderLock unlock];
         }
-        if (lightChanged) {
-            _lastLightOn = lon; _lastLightColor = lc;
-            _lastLX = lx; _lastLY = ly; _lastLI = li; _lastLD = ld; _lastLF = lf;
-            _proc.lightOn = lon; _proc.lightColor = lc;
-            _proc.lightX = lx; _proc.lightY = ly;
-            _proc.lightInt = li; _proc.lightDia = ld; _proc.lightFea = lf;
-        }
-        [_renderLock unlock];
+
+        if (enChanged && _enabled) [_player start];
+        if (path && ![path isEqualToString:_player.path]) [_player load:path];
+        if (paused != _lastPaused) { _lastPaused = paused; _player.paused = paused; }
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"poll exception: %@", e]);
     }
-
-    if (enChanged && _enabled) [_player start];
-    if (path && ![path isEqualToString:_player.path]) [_player load:path];
-    if (paused != _lastPaused) { _lastPaused = paused; _player.paused = paused; }
 }
 - (void)renderInto:(CVPixelBufferRef)pb pts:(double)pts {
     if (!_enabled || !pb) return;
+    @try {
+        [self _renderInto:pb pts:pts];
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"renderInto exception: %@", e]);
+    }
+}
+- (void)_renderInto:(CVPixelBufferRef)pb pts:(double)pts {
     [_dedupLock lock];
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     BOOL same = (_dedupBuf == pb);
@@ -907,7 +945,9 @@ static void processSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
             @try {
                 double pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
                 [[VCCore shared] renderInto:pb pts:pts];
-            } @catch (NSException *e) {}
+            } @catch (NSException *e) {
+                vcamLog([NSString stringWithFormat:@"render call exception: %@", e]);
+            }
         }
     }
 }
@@ -930,32 +970,50 @@ static void hookEncoder(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
     }
 }
 static void installHooks(void) {
-    Class c = objc_getClass("BWNodeOutput");
-    if (c) {
-        Method m = class_getInstanceMethod(c, sel_registerName("emitSampleBuffer:"));
-        if (m) {
-            origEmit = (void (*)(id, SEL, CMSampleBufferRef))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hookEmit);
-            vcamLog(@"Hooked BWNodeOutput emitSampleBuffer:");
+    @try {
+        Class c = objc_getClass("BWNodeOutput");
+        if (c) {
+            Method m = class_getInstanceMethod(c, sel_registerName("emitSampleBuffer:"));
+            if (m) {
+                origEmit = (void (*)(id, SEL, CMSampleBufferRef))method_getImplementation(m);
+                method_setImplementation(m, (IMP)hookEmit);
+                vcamLog(@"Hooked BWNodeOutput emitSampleBuffer:");
+            } else {
+                vcamLog(@"BWNodeOutput emitSampleBuffer: not found");
+            }
+        } else {
+            vcamLog(@"BWNodeOutput class not found");
         }
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"hook BWNodeOutput exception: %@", e]);
     }
-    Class c2 = objc_getClass("BWStillImageScalerNode");
-    if (c2) {
-        Method m = class_getInstanceMethod(c2, sel_registerName("renderSampleBuffer:forInput:"));
-        if (m) {
-            origScaler = (void (*)(id, SEL, CMSampleBufferRef, id))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hookScaler);
-            vcamLog(@"Hooked BWStillImageScalerNode renderSampleBuffer:forInput:");
+
+    @try {
+        Class c2 = objc_getClass("BWStillImageScalerNode");
+        if (c2) {
+            Method m = class_getInstanceMethod(c2, sel_registerName("renderSampleBuffer:forInput:"));
+            if (m) {
+                origScaler = (void (*)(id, SEL, CMSampleBufferRef, id))method_getImplementation(m);
+                method_setImplementation(m, (IMP)hookScaler);
+                vcamLog(@"Hooked BWStillImageScalerNode");
+            }
         }
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"hook Scaler exception: %@", e]);
     }
-    Class c3 = objc_getClass("BWPhotoEncoderNode");
-    if (c3) {
-        Method m = class_getInstanceMethod(c3, sel_registerName("renderSampleBuffer:forInput:"));
-        if (m) {
-            origEncoder = (void (*)(id, SEL, CMSampleBufferRef, id))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hookEncoder);
-            vcamLog(@"Hooked BWPhotoEncoderNode renderSampleBuffer:forInput:");
+
+    @try {
+        Class c3 = objc_getClass("BWPhotoEncoderNode");
+        if (c3) {
+            Method m = class_getInstanceMethod(c3, sel_registerName("renderSampleBuffer:forInput:"));
+            if (m) {
+                origEncoder = (void (*)(id, SEL, CMSampleBufferRef, id))method_getImplementation(m);
+                method_setImplementation(m, (IMP)hookEncoder);
+                vcamLog(@"Hooked BWPhotoEncoderNode");
+            }
         }
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"hook Encoder exception: %@", e]);
     }
 }
 
@@ -1048,6 +1106,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 + (instancetype)shared;
 - (void)show;
 - (void)hide;
+- (void)build;
+- (void)_build;
 @end
 
 @implementation VCBall
@@ -1085,6 +1145,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     });
 }
 - (void)build {
+    @try {
+        [self _build];
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"VCBall build exception: %@", e]);
+    }
+}
+- (void)_build {
     CGRect sb = [UIScreen mainScreen].bounds;
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
