@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+JBROOT=$(/usr/bin/jbroot 2>/dev/null || echo "/")
+DY="$JBROOT/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
+if [ -f "$DY" ]; then
+    /usr/bin/jb_ctl trustcache add "$DY" 2>/dev/null || \
+    /usr/bin/jbctl trustcache add "$DY" 2>/dev/null || true
+fi
+killall -9 SpringBoard 2>/dev/null || true
+exit 0
