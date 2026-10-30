@@ -43,42 +43,32 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           make clean
           make FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless 2>&1 || { echo "BUILD FAILED"; exit 1; }
-          echo "=== dylib (arm64) ==="
-          ls -la .theos/obj/arm64/VCamPlus.dylib 2>/dev/null || echo "MISSING arm64"
-          echo "=== dylib (arm64e) ==="
-          ls -la .theos/obj/arm64e/VCamPlus.dylib 2>/dev/null || echo "MISSING arm64e"
           test -f .theos/obj/arm64/VCamPlus.dylib || { echo "arm64 dylib missing"; exit 1; }
           test -f .theos/obj/arm64e/VCamPlus.dylib || { echo "arm64e dylib missing"; exit 1; }
 
-      - name: Merge and verify
+      - name: Merge and sign
         run: |
           mkdir -p artifact
           lipo -create .theos/obj/arm64/VCamPlus.dylib .theos/obj/arm64e/VCamPlus.dylib -output artifact/VCamPlus.dylib
           strip -x artifact/VCamPlus.dylib 2>/dev/null || strip artifact/VCamPlus.dylib
           ldid -S artifact/VCamPlus.dylib
           cp VCamPlus.plist artifact/ 2>/dev/null || true
-          echo "=== fat dylib info ==="
           lipo -info artifact/VCamPlus.dylib
-          file artifact/VCamPlus.dylib
-          ls -la artifact/
 
       - name: Build deb package (rootless)
         run: |
           cd "$GITHUB_WORKSPACE"
           mkdir -p debroot/DEBIAN
-
-          # 纯 TweakInject 布局：dylib + 注入 plist 放 DynamicLibraries
           mkdir -p "debroot/Library/MobileSubstrate/DynamicLibraries"
+
           cp artifact/VCamPlus.dylib "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
           cp artifact/VCamPlus.plist "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
 
-          # 维护脚本
           cp control debroot/DEBIAN/control
           cp preinst debroot/DEBIAN/preinst
           cp postinst debroot/DEBIAN/postinst
           cp postrm debroot/DEBIAN/postrm
 
-          # LF 行尾 + 可执行权限
           sed -i '' $'s/\r$//' debroot/DEBIAN/preinst debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
           chmod 0755 debroot/DEBIAN
           chmod 0644 debroot/DEBIAN/control
@@ -88,30 +78,11 @@ jobs:
           chmod 0755 "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
           chmod 0644 "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
 
-          fakeroot dpkg-deb -Zgzip -b debroot VCamPlus.deb
-          cp VCamPlus.deb artifact/
-
+          fakeroot dpkg-deb -Zgzip -b debroot artifact/VCamPlus.deb
           echo "=== deb package ==="
           ls -la artifact/VCamPlus.deb
-          file artifact/VCamPlus.deb
-
-          echo "=== deb 内容校验 ==="
-          dpkg-deb -c VCamPlus.deb
-          dpkg-deb -I VCamPlus.deb
-
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: VCamPlus-dylib
-          path: artifact/VCamPlus.dylib
-          if-no-files-found: error
-
-      - name: Upload plist
-        uses: actions/upload-artifact@v4
-        with:
-          name: VCamPlus-plist
-          path: artifact/VCamPlus.plist
-          if-no-files-found: warn
+          dpkg-deb -c artifact/VCamPlus.deb
+          dpkg-deb -I artifact/VCamPlus.deb
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
