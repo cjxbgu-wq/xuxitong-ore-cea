@@ -1,0 +1,121 @@
+name: Build VCamPlus
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install ldid fakeroot dpkg
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+
+      - name: Download iPhoneOS SDK
+        run: |
+          mkdir -p "$HOME/theos/sdks"
+          cd /tmp
+          curl -L -o sdks.tar.gz "https://github.com/theos/sdks/archive/refs/heads/master.tar.gz"
+          tar -xzf sdks.tar.gz
+          for v in 15.6 16.5; do
+            if [ -d "sdks-master/iPhoneOS${v}.sdk" ]; then
+              cp -R "sdks-master/iPhoneOS${v}.sdk" "$HOME/theos/sdks/"
+              echo "Copied iPhoneOS${v}.sdk"
+            fi
+          done
+          echo "=== installed SDKs ==="
+          ls -la "$HOME/theos/sdks/"
+
+      - name: Build tweak (arm64 + arm64e)
+        env:
+          THEOS: /Users/runner/theos
+          THEOS_PACKAGE_SCHEME: rootless
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          make clean
+          make FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless 2>&1 || { echo "BUILD FAILED"; exit 1; }
+          echo "=== dylib (arm64) ==="
+          ls -la .theos/obj/arm64/VCamPlus.dylib 2>/dev/null || echo "MISSING arm64"
+          echo "=== dylib (arm64e) ==="
+          ls -la .theos/obj/arm64e/VCamPlus.dylib 2>/dev/null || echo "MISSING arm64e"
+          test -f .theos/obj/arm64/VCamPlus.dylib || { echo "arm64 dylib missing"; exit 1; }
+          test -f .theos/obj/arm64e/VCamPlus.dylib || { echo "arm64e dylib missing"; exit 1; }
+
+      - name: Merge and verify
+        run: |
+          mkdir -p artifact
+          lipo -create .theos/obj/arm64/VCamPlus.dylib .theos/obj/arm64e/VCamPlus.dylib -output artifact/VCamPlus.dylib
+          strip -x artifact/VCamPlus.dylib 2>/dev/null || strip artifact/VCamPlus.dylib
+          ldid -S artifact/VCamPlus.dylib
+          cp VCamPlus.plist artifact/ 2>/dev/null || true
+          echo "=== fat dylib info ==="
+          lipo -info artifact/VCamPlus.dylib
+          file artifact/VCamPlus.dylib
+          ls -la artifact/
+
+      - name: Build deb package (rootless)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p debroot/DEBIAN
+
+          # 纯 TweakInject 布局：dylib + 注入 plist 放 DynamicLibraries
+          mkdir -p "debroot/Library/MobileSubstrate/DynamicLibraries"
+          cp artifact/VCamPlus.dylib "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
+          cp artifact/VCamPlus.plist "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
+
+          # 维护脚本
+          cp control debroot/DEBIAN/control
+          cp preinst debroot/DEBIAN/preinst
+          cp postinst debroot/DEBIAN/postinst
+          cp postrm debroot/DEBIAN/postrm
+
+          # LF 行尾 + 可执行权限
+          sed -i '' $'s/\r$//' debroot/DEBIAN/preinst debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
+          chmod 0755 debroot/DEBIAN
+          chmod 0644 debroot/DEBIAN/control
+          chmod 0755 debroot/DEBIAN/preinst
+          chmod 0755 debroot/DEBIAN/postinst
+          chmod 0755 debroot/DEBIAN/postrm
+          chmod 0755 "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
+          chmod 0644 "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
+
+          fakeroot dpkg-deb -Zgzip -b debroot VCamPlus.deb
+          cp VCamPlus.deb artifact/
+
+          echo "=== deb package ==="
+          ls -la artifact/VCamPlus.deb
+          file artifact/VCamPlus.deb
+
+          echo "=== deb 内容校验 ==="
+          dpkg-deb -c VCamPlus.deb
+          dpkg-deb -I VCamPlus.deb
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCamPlus-dylib
+          path: artifact/VCamPlus.dylib
+          if-no-files-found: error
+
+      - name: Upload plist
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCamPlus-plist
+          path: artifact/VCamPlus.plist
+          if-no-files-found: warn
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCamPlus-deb
+          path: artifact/VCamPlus.deb
+          if-no-files-found: error
