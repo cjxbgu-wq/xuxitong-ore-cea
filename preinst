@@ -1,5 +1,6 @@
 #!/bin/sh
-set -e
+set +e
 JBROOT=$(/usr/bin/jbroot 2>/dev/null || echo "/")
-mkdir -p "$JBROOT/Library/MobileSubstrate/DynamicLibraries"
+mkdir -p "$JBROOT/Library/MobileSubstrate/DynamicLibraries" 2>/dev/null || true
+mkdir -p "$JBROOT/usr/lib/TweakInject" 2>/dev/null || true
 exit 0
