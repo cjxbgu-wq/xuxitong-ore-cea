@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+JBROOT=$(/usr/bin/jbroot 2>/dev/null || echo "/")
+mkdir -p "$JBROOT/Library/MobileSubstrate/DynamicLibraries"
+exit 0
