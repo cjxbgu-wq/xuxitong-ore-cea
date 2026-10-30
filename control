@@ -1,9 +1,9 @@
 Package: com.vcamplus.tweak
 Name: VCamPlus
 Version: 1.0.0
-Architecture: iphoneos-arm64
+Architecture: iphoneos-arm64e
 Description: Virtual camera tweak (retro console UI)
 Maintainer: vcamplus
 Author: vcamplus
 Section: Tweaks
-Depends: mobilesubstrate
+Depends: ellekit
