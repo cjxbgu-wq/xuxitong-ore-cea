@@ -1,6 +1,6 @@
 //
 //  Tweak.m
-//  VCamPlus · 复古仪表盘 · 单文件 · 三轮审计版
+//  VCamPlus · 复古仪表盘 · 单文件
 //  功能：悬浮球 / 选择视频 / 替原 / 旋转 / 方向 / 缩放 / 镜像 / 复原 / 彩色注入（含参数）
 //
 
@@ -324,6 +324,30 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
 }
 
 // ======================= 图像处理 =======================
+// 附件拷贝（兼容 iOS 14；CVBufferCopyAttachments 是 iOS 15+ API）
+static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (!src || !dst) return;
+    if (@available(iOS 15.0, *)) {
+        CFDictionaryRef atts = CVBufferCopyAttachments(src, kCVAttachmentMode_ShouldPropagate);
+        if (atts) {
+            CVBufferSetAttachments(dst, atts, kCVAttachmentMode_ShouldPropagate);
+            CFRelease(atts);
+        }
+    } else {
+        static CFStringRef keys[3];
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            keys[0] = kCVImageBufferColorPrimariesKey;
+            keys[1] = kCVImageBufferTransferFunctionKey;
+            keys[2] = kCVImageBufferYCbCrMatrixKey;
+        });
+        for (int i = 0; i < 3; i++) {
+            CFTypeRef v = CVBufferGetAttachment(src, keys[i], NULL);
+            if (v) CVBufferSetAttachment(dst, keys[i], v, kCVAttachmentMode_ShouldPropagate);
+        }
+    }
+}
+
 @interface VCProc : NSObject
 @property (nonatomic, assign) VTPixelTransferSessionRef bgra, yuv, priv;
 @property (nonatomic, assign) VTPixelRotationSessionRef rot;
@@ -425,8 +449,7 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
     if (CVPixelBufferCreate(kCFAllocatorDefault, W, H, fmt, NULL, &canvas) != noErr || !canvas)
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
 
-    CFDictionaryRef atts = CVBufferCopyAttachments(input, kCVAttachmentMode_ShouldPropagate);
-    if (atts) { CVBufferSetAttachments(canvas, atts, kCVAttachmentMode_ShouldPropagate); CFRelease(atts); }
+    vcamCopyAttachments(input, canvas);
 
     double z = _zoom < 0.5 ? 0.5 : (_zoom > 4.0 ? 4.0 : _zoom);
     double ww = W / z, wh = H / z;
@@ -627,7 +650,7 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
         OSType fmt = CVPixelBufferGetPixelFormatType(s);
         CVPixelBufferRef d = NULL;
         if (CVPixelBufferCreate(kCFAllocatorDefault, ow, oh, fmt, NULL, &d) == noErr && d) {
-            CFStringRef v = kCFBooleanFalse;
+            CFTypeRef v = kCFBooleanFalse;
             if (total == 90) v = _rotCW90;
             else if (total == 180) v = _rot180;
             else if (total == 270) v = _rotCCW90;
@@ -701,8 +724,7 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
                     for (size_t y = 0; y < rows; y++) memcpy(db + y * drs, sb + y * srs, rb);
                 }
                 CVPixelBufferUnlockBaseAddress(baked, kCVPixelBufferLock_ReadOnly);
-                CFDictionaryRef atts = CVBufferCopyAttachments(baked, kCVAttachmentMode_ShouldPropagate);
-                if (atts) { CVBufferSetAttachments(canvas, atts, kCVAttachmentMode_ShouldPropagate); CFRelease(atts); }
+                vcamCopyAttachments(baked, canvas);
                 [self injectLight:canvas];
                 CVPixelBufferUnlockBaseAddress(canvas, 0);
                 CVPixelBufferRelease(baked);
