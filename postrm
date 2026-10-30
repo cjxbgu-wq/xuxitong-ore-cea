@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+killall -9 SpringBoard 2>/dev/null || true
+killall -9 mediaserverd 2>/dev/null || true
+exit 0
