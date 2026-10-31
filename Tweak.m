@@ -1,10 +1,6 @@
 //
 //  Tweak.m
-//  VCamPlus · 完整修复版（上）
-//  视频替换：三车道 + 三级回退 + 熔断（照搬源码1）
-//  填充：边界延伸（无重叠、无黑边）
-//  卡顿：process 结果缓存
-//  彩色注入整段未动
+//  VCamPlus · 血管仿生全自动版
 //
 
 #import <Foundation/Foundation.h>
@@ -14,6 +10,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
 #import <ImageIO/ImageIO.h>
+#import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -96,6 +93,48 @@ static void plSetMany(NSDictionary *kv) {
         if (v) d[k] = v; else [d removeObjectForKey:k];
     }
     [d writeToFile:kPlist atomically:YES];
+}
+
+// ======================= 血管仿生 · 全局状态 =======================
+static CGFloat gVesselBpm = 68.0;
+static CGFloat gVesselBpmTarget = 68.0;
+static CGFloat gVesselPhase = 0.0;
+static CFAbsoluteTime gVesselLastShift = 0.0;
+static CFAbsoluteTime gVesselLastTime = 0.0;
+
+static CGFloat vessel_autoBpm(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gVesselLastShift == 0.0 || now >= gVesselLastShift) {
+        gVesselBpmTarget = 68.0 + ((CGFloat)(arc4random_uniform(1200)) / 100.0 - 6.0);
+        gVesselLastShift = now + 5.0 + (CGFloat)(arc4random_uniform(500)) / 100.0;
+    }
+    gVesselBpm += (gVesselBpmTarget - gVesselBpm) * 0.02;
+    if (gVesselLastTime == 0.0) gVesselLastTime = now;
+    CGFloat dt = now - gVesselLastTime;
+    gVesselLastTime = now;
+    gVesselPhase += 2.0 * M_PI * (gVesselBpm / 60.0) * dt;
+    if (gVesselPhase > 1000.0) gVesselPhase -= 1000.0;
+    return gVesselBpm;
+}
+static CGFloat vessel_pulse(void) {
+    vessel_autoBpm();
+    return 0.85 + 0.15 * sin(gVesselPhase);
+}
+static CGFloat vessel_autoIntensity(void) {
+    CGFloat luma = [plRead()[@"lightLuma"] doubleValue];
+    if (luma <= 0.01) luma = 0.5;
+    CGFloat v = 0.25 + luma * 0.65;
+    return v < 0.25 ? 0.25 : (v > 0.8 ? 0.8 : v);
+}
+static void vessel_resolveColor(CGFloat *r, CGFloat *g, CGFloat *b) {
+    NSDictionary *pl = plRead();
+    uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
+    BOOL on = [pl[@"lightEnabled"] boolValue];
+    if (on && c != 0) {
+        *r = ((c >> 16) & 0xFF) / 255.0;
+        *g = ((c >>  8) & 0xFF) / 255.0;
+        *b = ( c        & 0xFF) / 255.0;
+    } else { *r = 0.75; *g = 0.18; *b = 0.12; }
 }
 
 // ======================= VT 私有 API =======================
@@ -454,7 +493,7 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     return *cropSlot;
 }
 
-// [填充] 边界延伸：前景覆盖后，只在空隙处把前景边缘像素向外拉伸（无重叠、无黑边）
+// 边界延伸（前景覆盖后，空隙处把前景边缘像素向外拉伸）
 static void vcamExtendEdges(CVPixelBufferRef canvas,
                             long dx0, long dy0, long dx1, long dy1) {
     size_t W = CVPixelBufferGetWidth(canvas);
@@ -646,9 +685,6 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @property (nonatomic, assign) int rotationAngle, sourceRotation;
 @property (nonatomic, assign) BOOL mirrored;
 @property (nonatomic, assign) double panX, panY, zoom;
-@property (nonatomic, assign) BOOL lightOn;
-@property (nonatomic, assign) uint32_t lightColor;
-@property (nonatomic, assign) int lightX, lightY, lightInt, lightDia, lightFea;
 @property (nonatomic, assign) CVPixelBufferRef pieceA, pieceB;
 @property (nonatomic, assign) size_t pieceAW, pieceAH, pieceBW, pieceBH;
 @property (nonatomic, assign) OSType pieceFmt;
@@ -667,8 +703,14 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @property (nonatomic, assign) double lastPanX, lastPanY, lastZoom;
 @property (nonatomic, assign) int lastRot;
 @property (nonatomic, assign) BOOL lastMirror;
-@property (nonatomic, assign) uint64_t lastLightSig;
 @property (nonatomic, assign) int cacheHitCount;
+
+// 血管仿生
+@property (nonatomic, assign) BOOL vesselFlowEnabled;
+@property (nonatomic, strong) CIDetector *faceDetector;
+@property (nonatomic, assign) CGRect cachedFaceRect;
+@property (nonatomic, assign) int faceDetectSkip;
+
 - (instancetype)init;
 - (BOOL)transfer:(CVPixelBufferRef)s to:(CVPixelBufferRef)d;
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED;
@@ -708,6 +750,9 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         _laneDisabled = [NSMutableDictionary dictionary];
         _s1Session = NULL;
         _cacheHitCount = 0;
+        _vesselFlowEnabled = NO;
+        _cachedFaceRect = CGRectZero;
+        _faceDetectSkip = 0;
     }
     return self;
 }
@@ -937,104 +982,131 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     }
     return canvas;
 }
-- (void)injectLight:(CVPixelBufferRef)buf {
-    if (!buf || !_lightOn || _lightColor == 0) return;
+
+// ======================= 血管仿生渲染 =======================
+// 双颊径向渐变 + 纵向血管纹理 + 心跳脉动
+- (void)injectVesselFlow:(CVPixelBufferRef)buf {
+    if (!buf) return;
+    CGFloat cr, cg, cb;
+    vessel_resolveColor(&cr, &cg, &cb);
+    if (cr < 0.01 && cg < 0.01 && cb < 0.01) return;
+
     size_t W = CVPixelBufferGetWidth(buf), H = CVPixelBufferGetHeight(buf);
-    if (W < 16 || H < 16 || CVPixelBufferGetPlaneCount(buf) != 2) return;
+    if (W < 64 || H < 64 || CVPixelBufferGetPlaneCount(buf) != 2) return;
     if ((W & 1) || (H & 1)) return;
-    uint8_t r = (_lightColor >> 16) & 0xFF;
-    uint8_t g = (_lightColor >> 8) & 0xFF;
-    uint8_t b = _lightColor & 0xFF;
-    uint8_t cy = (uint8_t)((299 * r + 587 * g + 114 * b) / 1000);
-    uint8_t cu = (uint8_t)((-169 * r - 331 * g + 500 * b) / 1000 + 128);
-    uint8_t cv = (uint8_t)((500 * r - 419 * g - 81 * b) / 1000 + 128);
-    int cx = (int)((int64_t)_lightX * W / 100);
-    int cyy = (int)((int64_t)_lightY * H / 100);
-    int minDim = (int)MIN(W, H);
-    int radius = (int)((int64_t)_lightDia * minDim / 200);
-    if (radius < 2) return;
-    int innerR = radius * (100 - _lightFea) * 80 / 10000;
-    int maxAlpha = _lightInt * 192 / 100;
-    int radiusSq = radius * radius, innerSq = innerR * innerR;
-    int feather = radiusSq - innerSq;
-    double invA = feather > 0 ? (double)maxAlpha / feather : 0;
+
+    if (!_faceDetector) {
+        @try {
+            _faceDetector = [CIDetector detectorOfType:CIDetectorTypeFace context:nil
+                            options:@{CIDetectorAccuracy: CIDetectorAccuracyLow}];
+        } @catch (NSException *e) { _faceDetector = nil; }
+    }
+    if (_faceDetectSkip <= 0) {
+        _faceDetectSkip = 3;
+        if (_faceDetector) {
+            @try {
+                CIImage *ci = [CIImage imageWithCVPixelBuffer:buf];
+                if (ci) {
+                    NSArray *faces = [_faceDetector featuresInImage:ci];
+                    if (faces.count > 0) {
+                        CGRect fb = ((CIFaceFeature *)faces[0]).bounds;
+                        _cachedFaceRect = CGRectMake(fb.origin.x,
+                            (CGFloat)H - fb.origin.y - fb.size.height,
+                            fb.size.width, fb.size.height);
+                    }
+                }
+            } @catch (NSException *e) {}
+        }
+    } else _faceDetectSkip--;
+
+    CGRect fr = _cachedFaceRect;
+    if (CGRectIsEmpty(fr)) return;
+
+    CGFloat pulse = vessel_pulse();
+    CGFloat intensity = vessel_autoIntensity();
+    CGFloat fw = fr.size.width, fh = fr.size.height;
+    CGFloat cx = fr.origin.x + fw * 0.5, cy = fr.origin.y + fh * 0.5;
+    CGFloat rx = fw * 0.35, ry = fh * 0.30;
+    CGFloat lcx = cx - rx * 0.7, lcy = cy - ry * 0.1;
+    CGFloat rcx = cx + rx * 0.7, rcy = cy - ry * 0.1;
+    CGFloat faceRatio = fh / (CGFloat)H;
+    CGFloat density = 0.3 + faceRatio * 0.4;
+    if (density < 0.3) density = 0.3;
+    if (density > 0.5) density = 0.5;
+
+    uint8_t cyV = (uint8_t)((299*cr*255 + 587*cg*255 + 114*cb*255) / 1000);
+    uint8_t cuV = (uint8_t)((-169*cr*255 - 331*cg*255 + 500*cb*255) / 1000 + 128);
+    uint8_t cvV = (uint8_t)(( 500*cr*255 - 419*cg*255 -  81*cb*255) / 1000 + 128);
+
+    CGFloat alphaBase = intensity * pulse;
     uint8_t *yp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 0);
     uint8_t *cp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 1);
     size_t ys = CVPixelBufferGetBytesPerRowOfPlane(buf, 0);
     size_t cs = CVPixelBufferGetBytesPerRowOfPlane(buf, 1);
     if (!yp || !cp) return;
-    int y0 = MAX(cyy - radius, 0), y1 = MIN(cyy + radius, (int)H);
+
+    int spacing = (int)(20.0 / (density + 0.1));
+    if (spacing < 8) spacing = 8; if (spacing > 40) spacing = 40;
+
+    int y0 = MAX((int)(cy - fh * 0.6), 0), y1 = MIN((int)(cy + fh * 0.6), (int)H);
+    int x0 = MAX((int)(cx - fw * 0.6), 0), x1 = MIN((int)(cx + fw * 0.6), (int)W);
     for (int y = y0; y < y1; y++) {
-        int dy = y - cyy, dySq = dy * dy;
-        if (dySq >= radiusSq) continue;
         uint8_t *row = yp + (size_t)y * ys;
-        int remain = radiusSq - dySq;
-        int dxMax = radius;
-        dxMax = (dxMax + remain / dxMax) / 2;
-        int x0 = MAX(cx - dxMax, 0), x1 = MIN(cx + dxMax, (int)W);
-        int c0 = MAX(cx - innerR, x0), c1 = MIN(cx + innerR, x1);
-        for (int x = x0; x < c0; x++) {
-            int dx = x - cx, dSq = dx * dx + dySq;
-            if (dSq <= innerSq || dSq >= radiusSq) continue;
-            int a = (int)((radiusSq - dSq) * invA);
-            row[x] = (uint8_t)((row[x] * (256 - a) + cy * a) >> 8);
-        }
-        for (int x = c0; x < c1; x++)
-            row[x] = (uint8_t)((row[x] * (256 - maxAlpha) + cy * maxAlpha) >> 8);
-        for (int x = c1; x < x1; x++) {
-            int dx = x - cx, dSq = dx * dx + dySq;
-            if (dSq <= innerSq || dSq >= radiusSq) continue;
-            int a = (int)((radiusSq - dSq) * invA);
-            row[x] = (uint8_t)((row[x] * (256 - a) + cy * a) >> 8);
+        for (int x = x0; x < x1; x++) {
+            CGFloat dxF = (x - cx) / (fw * 0.5), dyF = (y - cy) / (fh * 0.5);
+            CGFloat ell = 1.0 - (dxF*dxF + dyF*dyF);
+            if (ell <= 0.0) continue;
+            if (ell > 1.0) ell = 1.0;
+            CGFloat dl2 = (x-lcx)*(x-lcx)/(rx*rx) + (y-lcy)*(y-lcy)/(ry*ry);
+            CGFloat cl = dl2 < 1.0 ? 1.0 - dl2 : 0.0;
+            CGFloat dr2 = (x-rcx)*(x-rcx)/(rx*rx) + (y-rcy)*(y-rcy)/(ry*ry);
+            CGFloat cr2 = dr2 < 1.0 ? 1.0 - dr2 : 0.0;
+            CGFloat cheek = MAX(cl, cr2);
+            CGFloat vn = 0.0;
+            int m = x % spacing;
+            if (m < 2) {
+                uint32_t h = (uint32_t)(x*73856093u) ^ (uint32_t)(y*19349663u);
+                vn = (2 - m) / 2.0 * (0.5 + 0.5*((h & 0xFF)/255.0));
+            }
+            CGFloat a = alphaBase * (0.5*cheek + 0.5*vn) * ell;
+            if (a <= 0.01) continue;
+            if (a > 1.0) a = 1.0;
+            int ai = (int)(a * 256.0); if (ai > 256) ai = 256;
+            row[x] = (uint8_t)((row[x]*(256-ai) + cyV*ai) >> 8);
         }
     }
-    int bw2 = (int)W / 2, bh2 = (int)H / 2;
-    int cx2 = cx / 2, cy2 = cyy / 2;
-    int r2 = radius / 2, ir2 = innerR / 2;
-    int r2Sq = r2 * r2, ir2Sq = ir2 * ir2;
-    int f2 = r2Sq - ir2Sq;
-    double invC = f2 > 0 ? (double)maxAlpha / f2 : 0;
-    int yc0 = MAX(cy2 - r2, 0), yc1 = MIN(cy2 + r2, bh2);
+
+    // CbCr 半分辨率
+    int sc = spacing / 2; if (sc < 4) sc = 4;
+    CGFloat cxc = cx/2, cyc = cy/2, rxc = rx/2, ryc = ry/2;
+    CGFloat lcxc = lcx/2, lcyc = lcy/2, rcxc = rcx/2, rcyc = rcy/2;
+    CGFloat fwc = fw/2, fhc = fh/2;
+    int yc0 = MAX((int)(cyc - fhc*0.6), 0), yc1 = MIN((int)(cyc + fhc*0.6), (int)(H/2));
+    int xc0 = MAX((int)(cxc - fwc*0.6), 0), xc1 = MIN((int)(cxc + fwc*0.6), (int)(W/2));
     for (int y = yc0; y < yc1; y++) {
-        int dy = y - cy2, dySq = dy * dy;
-        if (dySq >= r2Sq) continue;
         uint8_t *row = cp + (size_t)y * cs;
-        int remain = r2Sq - dySq;
-        int dxMax = r2 < 1 ? 1 : r2;
-        dxMax = (dxMax + remain / dxMax) / 2;
-        int x0 = MAX(cx2 - dxMax, 0), x1 = MIN(cx2 + dxMax, bw2);
-        int c0 = MAX(cx2 - ir2, x0), c1 = MIN(cx2 + ir2, x1);
-        for (int x = x0; x < c0; x++) {
-            int dx = x - cx2, dSq = dx * dx + dySq;
-            if (dSq <= ir2Sq || dSq >= r2Sq) continue;
-            int a = (int)((r2Sq - dSq) * invC);
+        for (int x = xc0; x < xc1; x++) {
+            CGFloat dxF = (x-cxc)/(fwc*0.5), dyF = (y-cyc)/(fhc*0.5);
+            CGFloat ell = 1.0 - (dxF*dxF + dyF*dyF);
+            if (ell <= 0.0) continue; if (ell > 1.0) ell = 1.0;
+            CGFloat dl2 = (x-lcxc)*(x-lcxc)/(rxc*rxc) + (y-lcyc)*(y-lcyc)/(ryc*ryc);
+            CGFloat cl = dl2 < 1.0 ? 1.0 - dl2 : 0.0;
+            CGFloat dr2 = (x-rcxc)*(x-rcxc)/(rxc*rxc) + (y-rcyc)*(y-rcyc)/(ryc*ryc);
+            CGFloat cr2 = dr2 < 1.0 ? 1.0 - dr2 : 0.0;
+            CGFloat cheek = MAX(cl, cr2);
+            CGFloat vn = 0.0; int m = x % sc; if (m < 1) vn = 1.0 - m;
+            CGFloat a = alphaBase * (0.5*cheek + 0.5*vn) * ell * 0.6;
+            if (a <= 0.01) continue; if (a > 1.0) a = 1.0;
+            int ai = (int)(a * 256.0); if (ai > 256) ai = 256;
             int i = x * 2;
-            row[i] = (uint8_t)((row[i] * (256 - a) + cu * a) >> 8);
-            row[i+1] = (uint8_t)((row[i+1] * (256 - a) + cv * a) >> 8);
-        }
-        for (int x = c0; x < c1; x++) {
-            int i = x * 2;
-            row[i] = (uint8_t)((row[i] * (256 - maxAlpha) + cu * maxAlpha) >> 8);
-            row[i+1] = (uint8_t)((row[i+1] * (256 - maxAlpha) + cv * maxAlpha) >> 8);
-        }
-        for (int x = c1; x < x1; x++) {
-            int dx = x - cx2, dSq = dx * dx + dySq;
-            if (dSq <= ir2Sq || dSq >= r2Sq) continue;
-            int a = (int)((r2Sq - dSq) * invC);
-            int i = x * 2;
-            row[i] = (uint8_t)((row[i] * (256 - a) + cu * a) >> 8);
-            row[i+1] = (uint8_t)((row[i+1] * (256 - a) + cv * a) >> 8);
+            row[i]     = (uint8_t)((row[i]    *(256-ai) + cuV*ai) >> 8);
+            row[i + 1] = (uint8_t)((row[i + 1]*(256-ai) + cvV*ai) >> 8);
         }
     }
 }
+
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
     if (!s) return NULL;
-    uint64_t lightSig = ((uint64_t)(_lightOn ? 1 : 0) << 56)
-                      | ((uint64_t)(_lightColor & 0xFFFFFF) << 24)
-                      | ((uint64_t)(_lightX & 0x7F) << 17)
-                      | ((uint64_t)(_lightY & 0x7F) << 10)
-                      | ((uint64_t)(_lightInt & 0x7F) << 3)
-                      | (uint64_t)(_lightDia & 0x7);
     int curTotalRot = (_sourceRotation + _rotationAngle) % 360;
     if (curTotalRot < 0) curTotalRot += 360;
     BOOL cacheHit = (_lastOut != NULL)
@@ -1044,7 +1116,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
                      && fabs(_lastZoom - _zoom) < 1e-6)
                  && (_lastRot == curTotalRot)
                  && (_lastMirror == _mirrored)
-                 && (_lastLightSig == lightSig);
+                 && !_vesselFlowEnabled;
     if (cacheHit && _cacheHitCount < 30) {
         _cacheHitCount++;
         return (CVPixelBufferRef)CVPixelBufferRetain(_lastOut);
@@ -1055,7 +1127,6 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     _lastInPtr = s;
     _lastPanX = _panX; _lastPanY = _panY; _lastZoom = _zoom;
     _lastRot = curTotalRot; _lastMirror = _mirrored;
-    _lastLightSig = lightSig;
     _cacheHitCount = 0;
     if (_lastOut) CVPixelBufferRelease(_lastOut);
     _lastOut = out ? CVPixelBufferRetain(out) : NULL;
@@ -1125,7 +1196,8 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     if (extra) CVPixelBufferRelease(extra);
     if (rotOwned) CVPixelBufferRelease(rot);
     if (!baked) return NULL;
-    if (_lightOn && _lightColor != 0 && CVPixelBufferGetPlaneCount(baked) == 2) {
+    // 血管仿生（canvas 拷贝 + 注入）
+    if (_vesselFlowEnabled && CVPixelBufferGetPlaneCount(baked) == 2) {
         size_t bw = CVPixelBufferGetWidth(baked), bh = CVPixelBufferGetHeight(baked);
         if (!(bw & 1) && !(bh & 1)) {
             OSType fmt = CVPixelBufferGetPixelFormatType(baked);
@@ -1145,7 +1217,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
                 }
                 CVPixelBufferUnlockBaseAddress(baked, kCVPixelBufferLock_ReadOnly);
                 vcamCopyAttachments(baked, canvas);
-                [self injectLight:canvas];
+                [self injectVesselFlow:canvas];
                 CVPixelBufferUnlockBaseAddress(canvas, 0);
                 CVPixelBufferRelease(baked);
                 baked = canvas;
@@ -1156,8 +1228,6 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 }
 @end
 
-// ====== 第一段结束，不要在此加 @end（VCBall 的 @end 在第二段）======
-// ====== 第二段请从 "// 渲染核心" 开始接到这里 ======
 // ======================= 渲染核心 =======================
 @interface VCCore : NSObject
 @property (nonatomic, strong) VCPlayer *player;
@@ -1173,9 +1243,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @property (nonatomic, strong) dispatch_source_t timer;
 @property (nonatomic, assign) NSInteger lastEn, lastRot, lastPaused;
 @property (nonatomic, assign) double lastPanX, lastPanY, lastZoom;
-@property (nonatomic, assign) BOOL lastMirror, lastLightOn;
-@property (nonatomic, assign) uint32_t lastLightColor;
-@property (nonatomic, assign) int lastLX, lastLY, lastLI, lastLD, lastLF;
+@property (nonatomic, assign) BOOL lastMirror, lastVesselFlow;
 @property (nonatomic, assign) NSInteger lastVideoVersion;
 + (instancetype)shared;
 - (void)startRender;
@@ -1197,7 +1265,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         _dedupLock = [[NSLock alloc] init];
         _lastEn = -1; _lastRot = -1; _lastPaused = -1;
         _lastZoom = -1;
-        _lastMirror = NO; _lastLightOn = NO; _lastLightColor = 0;
+        _lastMirror = NO; _lastVesselFlow = NO;
         _lastVideoVersion = -1;
         BOOL isSB = [[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"];
         if (!isSB) {
@@ -1239,18 +1307,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         double py = [pl[@"userPanY"] doubleValue];
         double z = [pl[@"userZoom"] doubleValue];
         if (z <= 0) z = 1.0;
-        BOOL lon = [pl[@"lightEnabled"] boolValue];
-        uint32_t lc = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-        int lx = pl[@"lightX"] ? [pl[@"lightX"] intValue] : 50;
-        int ly = pl[@"lightY"] ? [pl[@"lightY"] intValue] : 50;
-        int li = pl[@"lightIntensity"] ? [pl[@"lightIntensity"] intValue] : 30;
-        int ld = pl[@"lightDiameter"] ? [pl[@"lightDiameter"] intValue] : 48;
-        int lf = pl[@"lightFeather"] ? [pl[@"lightFeather"] intValue] : 100;
-        if (lx <= 0 || lx > 100) lx = 50;
-        if (ly <= 0 || ly > 100) ly = 50;
-        if (li < 0 || li > 100) li = 30;
-        if (ld <= 0 || ld > 100) ld = 48;
-        if (lf < 0 || lf > 100) lf = 100;
+        BOOL vesselOn = [pl[@"vesselFlowEnabled"] boolValue];
         BOOL paused = [pl[@"paused"] boolValue];
         NSString *path = [pl[@"activePlaybackPath"] isKindOfClass:[NSString class]] ? pl[@"activePlaybackPath"] : nil;
         NSInteger videoVer = [pl[@"vcamVideoVersion"] integerValue];
@@ -1258,20 +1315,16 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         BOOL rotChanged = (rot != _lastRot);
         BOOL mirrorChanged = (mirror != _lastMirror);
         BOOL panChanged = (px != _lastPanX || py != _lastPanY || z != _lastZoom);
-        BOOL lightChanged = (lon != _lastLightOn || lc != _lastLightColor ||
-                             lx != _lastLX || ly != _lastLY || li != _lastLI || ld != _lastLD || lf != _lastLF);
-        if (enChanged || rotChanged || mirrorChanged || panChanged || lightChanged) {
+        BOOL vesselChanged = (vesselOn != _lastVesselFlow);
+        if (enChanged || rotChanged || mirrorChanged || panChanged || vesselChanged) {
             [_renderLock lock];
             if (enChanged) { _lastEn = en; _enabled = (en == 1); }
             if (rotChanged) { _lastRot = rot; _proc.rotationAngle = (int)(rot % 360); }
             if (mirrorChanged) { _lastMirror = mirror; _proc.mirrored = mirror; }
             if (panChanged) { _lastPanX = px; _lastPanY = py; _lastZoom = z; _proc.panX = px; _proc.panY = py; _proc.zoom = z; }
-            if (lightChanged) {
-                _lastLightOn = lon; _lastLightColor = lc;
-                _lastLX = lx; _lastLY = ly; _lastLI = li; _lastLD = ld; _lastLF = lf;
-                _proc.lightOn = lon; _proc.lightColor = lc;
-                _proc.lightX = lx; _proc.lightY = ly;
-                _proc.lightInt = li; _proc.lightDia = ld; _proc.lightFea = lf;
+            if (vesselChanged) {
+                _lastVesselFlow = vesselOn;
+                _proc.vesselFlowEnabled = vesselOn;
             }
             [_renderLock unlock];
         }
@@ -1514,17 +1567,16 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     return b;
 }
 
-@interface VCBall : NSObject <PHPickerViewControllerDelegate>
+@interface VCBall : NSObject
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) VCBallView *ball;
 @property (nonatomic, strong) UIView *panel;
-@property (nonatomic, strong) UIView *ctrlPage, *lightPage;
-@property (nonatomic, strong) UIButton *tabCtrlBtn, *tabLightBtn;
-@property (nonatomic, strong) UIButton *replaceBtn, *playBtn, *mirrorBtn, *lightBtn;
-@property (nonatomic, strong) NSMutableArray<UIButton *> *colorBtns;
-@property (nonatomic, strong) NSMutableArray<UILabel *> *sliderValueLabels;
-@property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
-@property (nonatomic, assign) BOOL visible, floating, paused, lightPageActive;
+@property (nonatomic, strong) UIView *ctrlPage, *vesselPage;
+@property (nonatomic, strong) UIButton *tabCtrlBtn, *tabVesselBtn;
+@property (nonatomic, strong) UIButton *replaceBtn, *playBtn, *mirrorBtn, *vesselBtn;
+@property (nonatomic, strong) UIView *colorIndicator;
+@property (nonatomic, strong) NSTimer *colorSampleTimer;
+@property (nonatomic, assign) BOOL visible, floating, paused, vesselPageActive;
 @property (nonatomic, assign) int buildRetries;
 + (instancetype)shared;
 - (void)show;
@@ -1533,9 +1585,10 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)_build;
 - (void)buildPanel;
 - (void)buildCtrlPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH;
-- (void)buildLightPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH;
+- (void)buildVesselPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH;
 - (void)refreshVisuals;
 - (void)refreshTabStyles;
+- (void)refreshVesselStatus;
 - (void)layoutPanel;
 - (void)toast:(NSString *)msg;
 - (void)pickMedia;
@@ -1552,14 +1605,14 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)zoomBy:(double)f;
 - (void)resetTransform;
 - (void)toggleMirror;
-- (void)toggleLight;
+- (void)toggleVesselFlow;
+- (void)startColorSampling;
+- (void)stopColorSampling;
+- (void)sampleScreenColor;
 - (void)ballTap;
 - (void)ballDrag:(UIPanGestureRecognizer *)g;
 - (void)switchCtrlTab;
-- (void)switchLightTab;
-- (void)colorTapped:(UIButton *)b;
-- (void)sliderChanged:(UISlider *)s;
-- (void)sliderCommit:(UISlider *)s;
+- (void)switchVesselTab;
 - (void)didActive;
 - (void)loadVideoProvider:(NSItemProvider *)p;
 - (void)loadImageProvider:(NSItemProvider *)p;
@@ -1586,7 +1639,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         [self.win removeFromSuperview];
         self.win.hidden = YES;
         self.win = nil; self.ball = nil; self.panel = nil;
-        self.ctrlPage = nil; self.lightPage = nil;
+        self.ctrlPage = nil; self.vesselPage = nil;
     });
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
@@ -1665,17 +1718,17 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     CGFloat tabY = 46, tabH = 26, contentW = pw - pad * 2;
     CGFloat tabW = (contentW - 6) / 2;
     _tabCtrlBtn = makeRetroBtn(@"控制", CGRectMake(pad, tabY, tabW, tabH), self, @selector(switchCtrlTab));
-    _tabLightBtn = makeRetroBtn(@"打光", CGRectMake(pad + tabW + 6, tabY, tabW, tabH), self, @selector(switchLightTab));
-    [_panel addSubview:_tabCtrlBtn]; [_panel addSubview:_tabLightBtn];
+    _tabVesselBtn = makeRetroBtn(@"血管", CGRectMake(pad + tabW + 6, tabY, tabW, tabH), self, @selector(switchVesselTab));
+    [_panel addSubview:_tabCtrlBtn]; [_panel addSubview:_tabVesselBtn];
     CGFloat pageY = tabY + tabH + 6;
     CGFloat pageH = ph - pageY - pad;
     _ctrlPage = [[UIView alloc] initWithFrame:CGRectMake(0, pageY, pw, pageH)];
     [self buildCtrlPage:_ctrlPage width:pw pad:pad contentW:contentW pageH:pageH];
     [_panel addSubview:_ctrlPage];
-    _lightPage = [[UIView alloc] initWithFrame:CGRectMake(0, pageY, pw, pageH)];
-    [self buildLightPage:_lightPage width:pw pad:pad contentW:contentW pageH:pageH];
-    _lightPage.hidden = YES;
-    [_panel addSubview:_lightPage];
+    _vesselPage = [[UIView alloc] initWithFrame:CGRectMake(0, pageY, pw, pageH)];
+    [self buildVesselPage:_vesselPage width:pw pad:pad contentW:contentW pageH:pageH];
+    _vesselPage.hidden = YES;
+    [_panel addSubview:_vesselPage];
     [self refreshVisuals];
     [_win addSubview:_panel];
 }
@@ -1716,72 +1769,196 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     up.tintColor = CGlow(); dn.tintColor = CGlow();
     [page addSubview:up]; [page addSubview:dn]; [page addSubview:lf]; [page addSubview:rt]; [page addSubview:rs]; [page addSubview:minus]; [page addSubview:plus];
     y += cell * 3 + dg * 2 + gap;
+}
+- (void)buildVesselPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
+    CGFloat y = 8;
 
-    _lightBtn = makeRetroBtn(@"彩色注入 · OFF", CGRectMake(pad, y, contentW, btnH), self, @selector(toggleLight));
-    [page addSubview:_lightBtn];
+    // 主开关
+    _vesselBtn = makeRetroBtn(@"🩸 仿生血管流动 · OFF", CGRectMake(pad, y, contentW, 40), self, @selector(toggleVesselFlow));
+    [page addSubview:_vesselBtn];
+    y += 48;
+
+    // 状态卡
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(pad, y, contentW, 52)];
+    card.backgroundColor = [CBtnBg() colorWithAlphaComponent:0.4];
+    card.layer.cornerRadius = 8;
+    [page addSubview:card];
+
+    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, contentW - 40, 14)];
+    l1.text = @"● 吸色 —"; l1.font = [UIFont systemFontOfSize:11]; l1.textColor = CTextMain();
+    l1.tag = 9001;
+    [card addSubview:l1];
+
+    UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(8, 22, contentW - 40, 14)];
+    l2.text = @"● 人脸 —"; l2.font = [UIFont systemFontOfSize:11]; l2.textColor = CTextMain();
+    l2.tag = 9002;
+    [card addSubview:l2];
+
+    UILabel *l3 = [[UILabel alloc] initWithFrame:CGRectMake(8, 36, contentW - 40, 14)];
+    l3.text = @"♥ 心率 68 bpm（自动）"; l3.font = [UIFont systemFontOfSize:11]; l3.textColor = CTextMain();
+    l3.tag = 9003;
+    [card addSubview:l3];
+
+    _colorIndicator = [[UIView alloc] initWithFrame:CGRectMake(contentW - 28, 16, 20, 20)];
+    _colorIndicator.layer.cornerRadius = 10;
+    _colorIndicator.layer.borderWidth = 2;
+    _colorIndicator.layer.borderColor = CDeep().CGColor;
+    _colorIndicator.backgroundColor = [UIColor blackColor];
+    _colorIndicator.userInteractionEnabled = NO;
+    [card addSubview:_colorIndicator];
+
+    // 状态刷新定时器
+    __weak typeof(self) w = self;
+    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        [w refreshVesselStatus];
+    }];
 }
-- (void)buildLightPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
-    _colorBtns = [NSMutableArray array];
-    _sliders = [NSMutableArray array];
-    _sliderValueLabels = [NSMutableArray array];
-    CGFloat y = 4;
-    uint32_t colors[6] = {0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF};
-    NSString *names[6] = {@"红", @"绿", @"蓝", @"黄", @"青", @"紫"};
-    CGFloat dotSize = 32, dotGap = 4;
-    CGFloat totalW = dotSize * 6 + dotGap * 5;
-    CGFloat startX = pad + (contentW - totalW) / 2;
-    for (int i = 0; i < 6; i++) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(startX + i * (dotSize + dotGap), y, dotSize, dotSize);
-        b.backgroundColor = [UIColor colorWithRed:((colors[i] >> 16) & 0xFF) / 255.0 green:((colors[i] >> 8) & 0xFF) / 255.0 blue:(colors[i] & 0xFF) / 255.0 alpha:1.0];
-        b.layer.cornerRadius = dotSize / 2; b.layer.borderWidth = 2; b.layer.borderColor = CDeep().CGColor;
-        b.tag = (NSInteger)colors[i];
-        [b setTitle:names[i] forState:UIControlStateNormal];
-        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:10];
-        [b addTarget:self action:@selector(colorTapped:) forControlEvents:UIControlEventTouchUpInside];
-        [page addSubview:b]; [_colorBtns addObject:b];
-    }
-    y += dotSize + 6;
-    NSString *titles[5] = {@"强度", @"直径", @"X", @"Y", @"羽化"};
-    NSString *keys[5] = {@"lightIntensity", @"lightDiameter", @"lightX", @"lightY", @"lightFeather"};
-    int defaults[5] = {30, 48, 50, 50, 100};
-    NSDictionary *pl = plRead();
-    CGFloat rowH = 30, rowGap = 6, sliderX = pad + 44, valueW = 34;
-    CGFloat sliderW = contentW - 44 - valueW - 6;
-    for (int i = 0; i < 5; i++) {
-        CGFloat ry = y + i * (rowH + rowGap);
-        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(pad, ry + 5, 44, 20)];
-        t.text = titles[i]; t.textColor = CGlow(); t.font = [UIFont systemFontOfSize:12];
-        [page addSubview:t];
-        UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, ry, sliderW, 30)];
-        s.minimumValue = 0; s.maximumValue = 100;
-        NSNumber *val = pl[keys[i]];
-        int v = val ? [val intValue] : defaults[i];
-        if (v < 0) v = 0; if (v > 100) v = 100;
-        s.value = (float)v;
-        s.minimumTrackTintColor = CBtnBorder(); s.maximumTrackTintColor = CBtnBg(); s.thumbTintColor = CGlow();
-        s.tag = i;
-        [s addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-        [s addTarget:self action:@selector(sliderCommit:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-        [page addSubview:s]; [_sliders addObject:s];
-        UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - valueW, ry + 5, valueW, 20)];
-        vl.text = [NSString stringWithFormat:@"%d", v]; vl.textColor = CTextMain(); vl.font = [UIFont boldSystemFontOfSize:12]; vl.textAlignment = NSTextAlignmentRight;
-        [page addSubview:vl]; [_sliderValueLabels addObject:vl];
-    }
+
+- (void)switchCtrlTab {
+    _vesselPageActive = NO;
+    _ctrlPage.hidden = NO;
+    _vesselPage.hidden = YES;
+    [self refreshTabStyles];
 }
-- (void)switchCtrlTab { _lightPageActive = NO; _ctrlPage.hidden = NO; _lightPage.hidden = YES; [self refreshTabStyles]; }
-- (void)switchLightTab { _lightPageActive = YES; _ctrlPage.hidden = YES; _lightPage.hidden = NO; [self refreshTabStyles]; }
+- (void)switchVesselTab {
+    _vesselPageActive = YES;
+    _ctrlPage.hidden = YES;
+    _vesselPage.hidden = NO;
+    [self refreshTabStyles];
+}
 - (void)refreshTabStyles {
     UIColor *activeBg = CGlow(), *inactiveBg = CBtnBg(), *activeFg = CDeep(), *inactiveFg = CTextMain();
-    [_tabCtrlBtn setTitleColor:(_lightPageActive ? inactiveFg : activeFg) forState:UIControlStateNormal];
-    [_tabCtrlBtn setBackgroundColor:(_lightPageActive ? inactiveBg : activeBg)];
-    [_tabLightBtn setTitleColor:(_lightPageActive ? activeFg : inactiveFg) forState:UIControlStateNormal];
-    [_tabLightBtn setBackgroundColor:(_lightPageActive ? activeBg : inactiveBg)];
+    [_tabCtrlBtn setTitleColor:(_vesselPageActive ? inactiveFg : activeFg) forState:UIControlStateNormal];
+    [_tabCtrlBtn setBackgroundColor:(_vesselPageActive ? inactiveBg : activeBg)];
+    [_tabVesselBtn setTitleColor:(_vesselPageActive ? activeFg : inactiveFg) forState:UIControlStateNormal];
+    [_tabVesselBtn setBackgroundColor:(_vesselPageActive ? activeBg : inactiveBg)];
 }
-- (void)colorTapped:(UIButton *)b { plSetMany(@{@"lightColor": @((uint32_t)b.tag), @"lightEnabled": @YES}); [self refreshVisuals]; [self toast:@"颜色已设置"]; }
-- (void)sliderChanged:(UISlider *)s { if (s.tag < 0 || s.tag >= (NSInteger)_sliderValueLabels.count) return; UILabel *vl = _sliderValueLabels[s.tag]; vl.text = [NSString stringWithFormat:@"%d", (int)lroundf(s.value)]; }
-- (void)sliderCommit:(UISlider *)s { if (s.tag < 0 || s.tag >= 5) return; NSString *keys[5] = {@"lightIntensity", @"lightDiameter", @"lightX", @"lightY", @"lightFeather"}; plSet(keys[s.tag], @((int)lroundf(s.value))); }
+
+- (void)toggleVesselFlow {
+    BOOL cur = [plRead()[@"vesselFlowEnabled"] boolValue];
+    BOOL next = !cur;
+    plSetMany(@{
+        @"vesselFlowEnabled": @(next),
+        @"lightEnabled": @(next),
+    });
+    if (next) [self startColorSampling];
+    else [self stopColorSampling];
+    [self refreshVisuals];
+    [self toast:(next ? @"血管流动开" : @"血管流动关")];
+}
+- (void)refreshVesselStatus {
+    if (!_vesselPage || _vesselPage.hidden) return;
+    NSDictionary *pl = plRead();
+    BOOL on = [pl[@"vesselFlowEnabled"] boolValue];
+    BOOL lightOn = [pl[@"lightEnabled"] boolValue];
+    uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
+
+    UILabel *l1 = [_vesselPage viewWithTag:9001];
+    UILabel *l2 = [_vesselPage viewWithTag:9002];
+    UILabel *l3 = [_vesselPage viewWithTag:9003];
+    if (!l1) return;
+
+    UIColor *dotC = [UIColor systemGrayColor];
+    NSString *s1 = @"● 吸色 关闭";
+    if (on && lightOn && c != 0) { dotC = [UIColor systemGreenColor]; s1 = @"● 吸色 正常"; }
+    else if (on && lightOn)     { dotC = [UIColor systemOrangeColor]; s1 = @"● 吸色 失败"; }
+    l1.text = s1;
+    l1.textColor = dotC;
+    _colorIndicator.backgroundColor = c != 0
+        ? [UIColor colorWithRed:((c>>16)&0xFF)/255.0 green:((c>>8)&0xFF)/255.0 blue:(c&0xFF)/255.0 alpha:1.0]
+        : [UIColor blackColor];
+
+    BOOL faceLocked = [pl[@"vesselFaceLocked"] boolValue];
+    l2.text = faceLocked ? @"● 人脸 已锁定" : @"● 人脸 未检测";
+    l2.textColor = faceLocked ? [UIColor systemGreenColor] : [UIColor systemGrayColor];
+
+    l3.text = [NSString stringWithFormat:@"♥ 心率 %d bpm（自动）", (int)gVesselBpm];
+    l3.textColor = CTextMain();
+}
+
+// ======================= 吸色器（加权采样）=======================
+- (void)startColorSampling {
+    [_colorSampleTimer invalidate];
+    __weak typeof(self) w = self;
+    _colorSampleTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 repeats:YES block:^(NSTimer *t) {
+        [w sampleScreenColor];
+    }];
+}
+- (void)stopColorSampling {
+    [_colorSampleTimer invalidate];
+    _colorSampleTimer = nil;
+}
+- (void)sampleScreenColor {
+    @try {
+        UIImage *snapshot = nil;
+        UIScreen *screen = [UIScreen mainScreen];
+        SEL s1 = NSSelectorFromString(@"_snapshotIncludingStatusBar:");
+        if ([screen respondsToSelector:s1]) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            snapshot = [screen performSelector:s1 withObject:@(NO)];
+            #pragma clang diagnostic pop
+        }
+        if (!snapshot) {
+            SEL s2 = NSSelectorFromString(@"_screenshot");
+            UIApplication *app = [UIApplication sharedApplication];
+            if ([app respondsToSelector:s2]) {
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                snapshot = [app performSelector:s2];
+                #pragma clang diagnostic pop
+            }
+        }
+        if (!snapshot) return;
+        CGImageRef cgImg = snapshot.CGImage; if (!cgImg) return;
+        size_t w = CGImageGetWidth(cgImg), h = CGImageGetHeight(cgImg);
+        size_t edgeW = w*15/100, edgeH = h*15/100;
+        CGRect rects[4] = {
+            CGRectMake(0,0,w,edgeH), CGRectMake(0,h-edgeH,w,edgeH),
+            CGRectMake(0,edgeH,edgeW,h-2*edgeH), CGRectMake(w-edgeW,edgeH,edgeW,h-2*edgeH),
+        };
+        CGFloat tR=0,tG=0,tB=0,tW=0, bSat=0,bR=0,bG=0,bB=0;
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        for (int e=0;e<4;e++) {
+            CGFloat eR=0,eG=0,eB=0; int v=0;
+            for (int k=0;k<3;k++) {
+                CGRect r = rects[e];
+                CGFloat px = r.origin.x + r.size.width*(0.2+k*0.3);
+                CGFloat py = r.origin.y + r.size.height*(0.2+k*0.3);
+                CGImageRef cImg = CGImageCreateWithImageInRect(cgImg, CGRectMake(px,py,1,1));
+                if (!cImg) continue;
+                unsigned char pix[4]={0};
+                CGContextRef ctx = CGBitmapContextCreate(pix,1,1,8,4,cs,kCGImageAlphaPremultipliedLast);
+                CGContextDrawImage(ctx,CGRectMake(0,0,1,1),cImg);
+                CGContextRelease(ctx); CGImageRelease(cImg);
+                eR += pix[0]/255.0; eG += pix[1]/255.0; eB += pix[2]/255.0; v++;
+            }
+            if (!v) continue;
+            eR/=v; eG/=v; eB/=v;
+            CGFloat mx = MAX(eR,MAX(eG,eB)), mn = MIN(eR,MIN(eG,eB));
+            CGFloat sat = mx>0.01 ? (mx-mn)/mx : 0;
+            if (sat > 0.15 && mx > 0.2) {
+                CGFloat wg = sat*sat;
+                tR += eR*wg; tG += eG*wg; tB += eB*wg; tW += wg;
+            }
+            if (sat > bSat) { bSat=sat; bR=eR; bG=eG; bB=eB; }
+        }
+        CGColorSpaceRelease(cs);
+        CGFloat r=0,g=0,b=0;
+        if (tW > 0.3) { r=tR/tW; g=tG/tW; b=tB/tW; }
+        else if (bSat > 0.25) { r=bR; g=bG; b=bB; }
+        else return;  // 抗闪断：保持上一帧
+        CGFloat luma = 0.299*r + 0.587*g + 0.114*b;
+        uint32_t packed = ((uint32_t)(r*255)<<16) | ((uint32_t)(g*255)<<8) | (uint32_t)(b*255);
+        plSetMany(@{@"lightColor":@(packed), @"lightLuma":@(luma), @"lightEnabled":@YES});
+        dispatch_async(dispatch_get_main_queue(), ^{
+            _colorIndicator.backgroundColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
+        });
+    } @catch (NSException *e) {
+        vcamLog([NSString stringWithFormat:@"ColorSample err: %@", e]);
+    }
+}
+
 - (void)ballTap {
     _visible = !_visible;
     if (_visible) { [self layoutPanel]; _panel.hidden = NO; [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 1; }]; }
@@ -1814,10 +1991,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     BOOL mi = [pl[@"mirrored"] boolValue];
     _mirrorBtn.backgroundColor = mi ? CBtnBorder() : CBtnBg();
     _mirrorBtn.tintColor = mi ? CGlow() : CTextMain();
-    BOOL lon = [pl[@"lightEnabled"] boolValue];
-    [_lightBtn setTitle:(lon ? @"彩色注入 · ON" : @"彩色注入 · OFF") forState:UIControlStateNormal];
-    _lightBtn.backgroundColor = lon ? CGlow() : CBtnBg();
-    [_lightBtn setTitleColor:(lon ? CDeep() : CTextMain()) forState:UIControlStateNormal];
+    BOOL vesselOn = [pl[@"vesselFlowEnabled"] boolValue];
+    if (_vesselBtn) {
+        [_vesselBtn setTitle:(vesselOn ? @"🩸 仿生血管流动 · ON" : @"🩸 仿生血管流动 · OFF") forState:UIControlStateNormal];
+        _vesselBtn.backgroundColor = vesselOn ? CGlow() : CBtnBg();
+        [_vesselBtn setTitleColor:(vesselOn ? CDeep() : CTextMain()) forState:UIControlStateNormal];
+        _vesselBtn.layer.borderColor = vesselOn ? CDeep().CGColor : CBtnBorder().CGColor;
+    }
     _paused = [pl[@"paused"] boolValue];
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightBold];
     [_playBtn setImage:[UIImage systemImageNamed:(_paused ? @"play.fill" : @"pause.fill") withConfiguration:cfg] forState:UIControlStateNormal];
@@ -1917,12 +2097,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)zoomBy:(double)f { double z = [plRead()[@"userZoom"] doubleValue] * f; if (z < 0.5) z = 0.5; if (z > 4.0) z = 4.0; plSet(@"userZoom", @(z)); [self toast:[NSString stringWithFormat:@"缩放 %.2f", z]]; }
 - (void)resetTransform { plSetMany(@{@"userPanX": @(0.0), @"userPanY": @(0.0), @"userZoom": @(1.0)}); [self toast:@"已复原"]; }
 - (void)toggleMirror { BOOL m = [plRead()[@"mirrored"] boolValue]; plSet(@"mirrored", @(!m)); [self refreshVisuals]; [self toast:(m ? @"镜像关" : @"镜像开")]; }
-- (void)toggleLight {
-    BOOL on = [plRead()[@"lightEnabled"] boolValue];
-    if (!on) { uint32_t c = (uint32_t)[plRead()[@"lightColor"] unsignedIntValue]; if (c == 0) plSetMany(@{@"lightEnabled": @YES, @"lightColor": @(0xFF0000)}); else plSet(@"lightEnabled", @YES); }
-    else { plSet(@"lightEnabled", @NO); }
-    [self refreshVisuals]; [self toast:(on ? @"彩色注入关" : @"彩色注入开")];
-}
 - (void)toast:(NSString *)msg {
     if (!_win) return;
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 200, 40)];
