@@ -1001,15 +1001,24 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
             vcamLog([NSString stringWithFormat:@"[vcam] CIDetector init: %@", _faceDetector ? @"OK" : @"FAIL"]);
         } @catch (NSException *e) { _faceDetector = nil; }
     }
+    // [修复1] 复用 CIContext，用于把 YUV 420f 转 BGRA 再喂 CIDetector
+    static CIContext *sFaceCtx = nil;
+    if (!sFaceCtx) {
+        sFaceCtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    }
     if (_faceDetectSkip <= 0) {
         _faceDetectSkip = 3;
-        if (_faceDetector) {
+        if (_faceDetector && sFaceCtx) {
             @try {
                 CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
                 CIImage *ci = [CIImage imageWithCVPixelBuffer:buf options:@{kCIImageColorSpace:[NSNull null]}];
                 CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
-                if (ci) {
-                    NSArray *faces = [_faceDetector featuresInImage:ci];
+                // [修复1] YUV 420f 直喂 CIDetector 检测率极低，先转 BGRA
+                CGImageRef cg = ci ? [sFaceCtx createCGImage:ci fromRect:ci.extent] : NULL;
+                CIImage *bgraCI = cg ? [CIImage imageWithCGImage:cg] : nil;
+                if (cg) CGImageRelease(cg);
+                if (bgraCI) {
+                    NSArray *faces = [_faceDetector featuresInImage:bgraCI];
                     static int sFaceLogCount = 0;
                     if (sFaceLogCount < 10) {
                         sFaceLogCount++;
@@ -1245,7 +1254,6 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     return baked;
 }
 @end
-
 // ======================= 渲染核心 =======================
 @interface VCCore : NSObject
 @property (nonatomic, strong) VCPlayer *player;
@@ -1963,12 +1971,19 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         };
         CGFloat tR=0,tG=0,tB=0,tW=0, bSat=0,bR=0,bG=0,bB=0;
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        // [修复2] 计算截图像素→屏幕点的缩放比，用于跳过面板/球遮挡的采样点
+        CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
+        CGFloat pxScale = (scrW > 0) ? ((CGFloat)w / scrW) : 1.0;
         for (int e=0;e<4;e++) {
             CGFloat eR=0,eG=0,eB=0; int v=0;
             for (int k=0;k<3;k++) {
                 CGRect r = rects[e];
                 CGFloat px = r.origin.x + r.size.width*(0.2+k*0.3);
                 CGFloat py = r.origin.y + r.size.height*(0.2+k*0.3);
+                // [修复2] 跳过悬浮面板/悬浮球所在的采样点，避免污染边缘取色
+                CGPoint spt = CGPointMake(px / pxScale, py / pxScale);
+                if (_panel && !_panel.hidden && CGRectContainsPoint(_panel.frame, spt)) continue;
+                if (_ball && CGRectContainsPoint(_ball.frame, spt)) continue;
                 CGImageRef cImg = CGImageCreateWithImageInRect(cgImg, CGRectMake(px,py,1,1));
                 if (!cImg) continue;
                 unsigned char pix[4]={0};
