@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>enabled</key>
-    <false/>
+    <true/>
     <key>activePlaybackPath</key>
     <string>/var/mobile/Media/DCIM/vcam.mp4</string>
     <key>manualRotation</key>
@@ -19,9 +19,9 @@
     <key>userZoom</key>
     <real>1.0</real>
     <key>vesselFlowEnabled</key>
-    <false/>
+    <true/>
     <key>lightEnabled</key>
-    <false/>
+    <true/>
     <key>lightColor</key>
     <integer>0</integer>
     <key>lightLuma</key>
@@ -29,6 +29,6 @@
     <key>vesselFaceLocked</key>
     <false/>
     <key>logEnabled</key>
-    <false/>
+    <true/>
 </dict>
 </plist>
