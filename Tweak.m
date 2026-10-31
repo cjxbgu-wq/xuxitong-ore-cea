@@ -1,12 +1,9 @@
 //
 //  Tweak.m
-//  VCamPlus · 最终修复版
-//  修复：绿屏 / 绿边 / 填充视频像素 / 图片视频一钮选择 / UI 重排
-//  视频替换机制：照搬源码1 GPUImageProcessor transferPixelBuffer:toPixelBuffer:token:
-//    - 标准车道：BGRA / 420f / 420v / p420 一步直转
-//    - 私有格式车道：① YUV 源直转 → ② YUV staging 两步法 → ③ BGRA staging + 预裁剪 + Normal
-//    - 同目标格式连续失败 2 次 → 熔断，保相机原画面（消除整屏绿）
-//  彩色注入(light*) 整段未动
+//  VCamPlus · 最终完整修复版
+//  修复：绿屏 / 绿边 / 模糊填充 / 图片视频一钮选择 / 图片 pan-zoom / 视频切换 / 下箭头 / UI
+//  视频替换机制：照搬源码1 三车道 + 三级回退 + 熔断
+//  彩色注入整段未动
 //
 
 #import <Foundation/Foundation.h>
@@ -200,8 +197,6 @@ typedef OSStatus (*VTRotInvT)(VTPixelRotationSessionRef);
     [_thread start];
 }
 - (void)stop { _shouldRun = NO; }
-
-// [FIX-2] reader 不写死 width/height，慢动作/延时源能正常解码
 - (NSDictionary *)readerOutputSettings {
     return @{ (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f') };
 }
@@ -397,7 +392,6 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
         if (v) CVBufferSetAttachment(dst, keys[i], v, kCVAttachmentMode_ShouldPropagate);
     }
 }
-// [FIX-3] 绿边修复：Trim crop offset 非整数判定
 static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL *fixH, BOOL *fixV) {
     *fixH = NO; *fixV = NO;
     if (!src || !dst) return;
@@ -416,7 +410,6 @@ static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, B
         *fixV = (fabs(off - floor(off + 0.5)) > 1e-3);
     }
 }
-// [FIX-3] 中心整数预裁剪（自有 staging，偶对齐，memcpy 到 cropSlot）
 static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferRef dst,
                                         CVPixelBufferRef *cropSlot, size_t *slotW, size_t *slotH) {
     if (!staging || !dst || !cropSlot) return NULL;
@@ -460,11 +453,15 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     return *cropSlot;
 }
 
-// ======================= [FIX-6] 图片模式 =======================
+// ======================= 图片模式 =======================
 @interface VCImageStore : NSObject
 + (instancetype)shared;
 - (BOOL)syncWithPath:(NSString *)path version:(int)ver rotation:(int)rot;
 - (BOOL)replaceCameraBuffer:(CVPixelBufferRef)cam;
+- (BOOL)replaceCameraBuffer:(CVPixelBufferRef)cam
+                       panX:(double)panX
+                       panY:(double)panY
+                       zoom:(double)zoom;
 @end
 @implementation VCImageStore {
     NSLock *_lock;
@@ -518,6 +515,12 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     return YES;
 }
 - (BOOL)replaceCameraBuffer:(CVPixelBufferRef)cam {
+    return [self replaceCameraBuffer:cam panX:0 panY:0 zoom:1.0];
+}
+- (BOOL)replaceCameraBuffer:(CVPixelBufferRef)cam
+                       panX:(double)panX
+                       panY:(double)panY
+                       zoom:(double)zoom {
     if (!cam) return NO;
     [_lock lock];
     if (!_srcImage) { [_lock unlock]; return NO; }
@@ -541,10 +544,14 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     BOOL swap = (_rotation == 90 || _rotation == 270);
     CGFloat effW = swap ? (CGFloat)_srcH : (CGFloat)_srcW;
     CGFloat effH = swap ? (CGFloat)_srcW : (CGFloat)_srcH;
-    CGFloat scale = MAX((CGFloat)camW / effW, (CGFloat)camH / effH);
+    CGFloat baseScale = MAX((CGFloat)camW / effW, (CGFloat)camH / effH);
+    CGFloat z = zoom < 0.5 ? 0.5 : (zoom > 4.0 ? 4.0 : zoom);
+    CGFloat scale = baseScale * z;
     CGFloat drawW = (CGFloat)_srcW * scale;
     CGFloat drawH = (CGFloat)_srcH * scale;
-    CGContextTranslateCTM(ctx, camW / 2.0, camH / 2.0);
+    CGFloat cx = camW / 2.0 + panX * camW;
+    CGFloat cy = camH / 2.0 - panY * camH;
+    CGContextTranslateCTM(ctx, cx, cy);
     CGContextRotateCTM(ctx, (CGFloat)_rotation * (CGFloat)M_PI / 180.0);
     CGContextDrawImage(ctx, CGRectMake(-drawW/2.0, -drawH/2.0, drawW, drawH), _srcImage);
     CGContextRelease(ctx);
@@ -588,24 +595,24 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
 @property (nonatomic, assign) CVPixelBufferRef pieceA, pieceB;
 @property (nonatomic, assign) size_t pieceAW, pieceAH, pieceBW, pieceBH;
 @property (nonatomic, assign) OSType pieceFmt;
-// [FIX-3] 绿边预裁剪槽
 @property (nonatomic, assign) CVPixelBufferRef cropBuf;
 @property (nonatomic, assign) size_t cropW, cropH;
-// [FIX-5] 背景铺满中转
 @property (nonatomic, assign) CVPixelBufferRef bgBuf;
 @property (nonatomic, assign) size_t bgW, bgH;
 @property (nonatomic, assign) OSType bgFmt;
-
-// ===== [照搬源码1] 三级回退 + 熔断 =====
-@property (nonatomic, assign) VTPixelTransferSessionRef s1Session;   // staging 用（Trim）
-@property (nonatomic, strong) NSLock *laneLock;                       // 私有车道串行
+// [模糊背景] 源帧 1/8 小图 Normal 缩小→放大
+@property (nonatomic, assign) CVPixelBufferRef smallBuf;
+@property (nonatomic, assign) size_t smallW, smallH;
+@property (nonatomic, assign) OSType smallFmt;
+// 三级回退 + 熔断
+@property (nonatomic, assign) VTPixelTransferSessionRef s1Session;
+@property (nonatomic, strong) NSLock *laneLock;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneFailCounts;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneDisabled;
-@property (nonatomic, assign) CVPixelBufferRef yuvStaging;            // YUV 两步法中转
+@property (nonatomic, assign) CVPixelBufferRef yuvStaging;
 @property (nonatomic, assign) size_t yuvStagingW, yuvStagingH;
-@property (nonatomic, assign) CVPixelBufferRef bgraStaging;           // BGRA 两步法中转
+@property (nonatomic, assign) CVPixelBufferRef bgraStaging;
 @property (nonatomic, assign) size_t bgraStagingW, bgraStagingH;
-
 - (instancetype)init;
 - (BOOL)transfer:(CVPixelBufferRef)s to:(CVPixelBufferRef)d;
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED;
@@ -640,8 +647,6 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
         _rot180 = r180 ? *(CFStringRef *)r180 : CFSTR("180");
         if (_rotCreate && _rotTransfer) _rotCreate(kCFAllocatorDefault, &_rot);
         _zoom = 1.0;
-
-        // [照搬源码1]
         _laneLock = [[NSLock alloc] init];
         _laneFailCounts = [NSMutableDictionary dictionary];
         _laneDisabled = [NSMutableDictionary dictionary];
@@ -654,6 +659,7 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     if (_pieceB) CVPixelBufferRelease(_pieceB);
     if (_cropBuf) CVPixelBufferRelease(_cropBuf);
     if (_bgBuf) CVPixelBufferRelease(_bgBuf);
+    if (_smallBuf) CVPixelBufferRelease(_smallBuf);
     if (_yuvStaging) CVPixelBufferRelease(_yuvStaging);
     if (_bgraStaging) CVPixelBufferRelease(_bgraStaging);
     if (_bgra) VTPixelTransferSessionInvalidate(_bgra);
@@ -663,8 +669,6 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     if (_s1Session) VTPixelTransferSessionInvalidate(_s1Session);
     if (_rot && _rotInv) _rotInv(_rot);
 }
-
-// Normal 等比缩放 session（预裁剪后比例已匹配，无 crop 概念，边界安全）
 - (VTPixelTransferSessionRef)normalSession {
     if (_normal) return _normal;
     @synchronized(self) {
@@ -677,30 +681,17 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     }
     return _normal;
 }
-
-// ===== [照搬源码1 transferPixelBuffer:toPixelBuffer:token:] =====
-// 车道1：BGRA 目标 → 一步直转
-// 车道2：420f/420v/p420 目标 → 一步直转
-// 车道3：私有格式目标 →
-//   ① YUV 源直转（首选，YUV 域缩放，边界安全）
-//   ② YUV staging 两步法（直转失败时，仍 YUV 域）
-//   ③ BGRA staging 两步法 + 非整数 crop 预裁剪 + Normal（最后回退，修绿边）
-// 任何一级成功即返回；全失败 → 同格式连续 2 次 → 熔断（保相机原画面）
+// [照搬源码1] 三车道 + 三级回退 + 熔断
 - (BOOL)transfer:(CVPixelBufferRef)s to:(CVPixelBufferRef)d {
     if (!s || !d) return NO;
     OSType dstFormat = CVPixelBufferGetPixelFormatType(d);
     size_t srcW = CVPixelBufferGetWidth(s), srcH = CVPixelBufferGetHeight(s);
     size_t dstW = CVPixelBufferGetWidth(d), dstH = CVPixelBufferGetHeight(d);
-
     if ([_laneDisabled[@(dstFormat)] boolValue]) return NO;
-
     BOOL isYuvLane  = ((dstFormat & 0xffffffef) == '420f' || dstFormat == 0x70343230);
     BOOL isBgraLane = (dstFormat == kCVPixelFormatType_32BGRA);
-
-    // ---------- 私有格式车道：三级回退 ----------
     if (!isBgraLane && !isYuvLane) {
         [_laneLock lock];
-
         if (!_s1Session) {
             if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_s1Session) == noErr) {
                 VTSessionSetProperty(_s1Session, CFSTR("ScalingMode"), CFSTR("Trim"));
@@ -713,20 +704,15 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
                 VTSessionSetProperty(_priv, CFSTR("RealTime"), kCFBooleanTrue);
             }
         }
-
         OSType srcFmt = CVPixelBufferGetPixelFormatType(s);
         BOOL srcYuvPlanar = (srcFmt == '420f' || srcFmt == '420v' || srcFmt == 0x70343230);
         BOOL sizeDiff = (srcW != dstW || srcH != dstH);
-
-        // ① 直转快路径：YUV 源 → 私有格式（一次 VT，YUV 域缩放，边界安全）
         if (srcYuvPlanar && sizeDiff && _priv) {
             OSStatus st = VTPixelTransferSessionTransferImage(_priv, s, d);
             if (st == noErr) { [_laneLock unlock]; return YES; }
             vcamLog([NSString stringWithFormat:@"[vcam] direct YUV->0x%x failed (%d), fallback",
                      (unsigned)dstFormat, (int)st]);
         }
-
-        // ② YUV staging 两步法：源→420f staging（源尺寸）→私有格式
         if (srcYuvPlanar && sizeDiff && _priv && _s1Session) {
             if (!_yuvStaging || _yuvStagingW != srcW || _yuvStagingH != srcH) {
                 if (_yuvStaging) { CVPixelBufferRelease(_yuvStaging); _yuvStaging = NULL; }
@@ -740,12 +726,8 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
                     OSStatus st2 = VTPixelTransferSessionTransferImage(_priv, _yuvStaging, d);
                     if (st2 == noErr) { [_laneLock unlock]; return YES; }
                 }
-                vcamLog([NSString stringWithFormat:@"[vcam] YUV staging->0x%x failed, fallback BGRA",
-                         (unsigned)dstFormat]);
             }
         }
-
-        // ③ BGRA staging 两步法 + 非整数 crop 预裁剪 + Normal（最后回退，修绿边）
         if (_priv && _s1Session) {
             if (!_bgraStaging || _bgraStagingW != srcW || _bgraStagingH != srcH) {
                 if (_bgraStaging) { CVPixelBufferRelease(_bgraStaging); _bgraStaging = NULL; }
@@ -774,23 +756,17 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
                 }
             }
         }
-
         [_laneLock unlock];
-
-        // 熔断：同目标格式连续 2 次失败 → 永久跳过（保相机原画面）
         @synchronized(self) {
             NSInteger fails = [_laneFailCounts[@(dstFormat)] integerValue] + 1;
             _laneFailCounts[@(dstFormat)] = @(fails);
             if (fails >= 2) {
                 _laneDisabled[@(dstFormat)] = @YES;
-                vcamLog([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format 0x%x (keep camera)",
-                         (unsigned)dstFormat]);
+                vcamLog([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format 0x%x", (unsigned)dstFormat]);
             }
         }
         return NO;
     }
-
-    // ---------- 标准车道：一步直转 ----------
     VTPixelTransferSessionRef sess = isBgraLane ? _bgra : _yuv;
     if (!sess) return NO;
     [_laneLock lock];
@@ -806,7 +782,6 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     }
     return YES;
 }
-
 - (CVPixelBufferRef)pieceAForW:(size_t)w H:(size_t)h fmt:(OSType)fmt {
     if (_pieceA && _pieceAW == w && _pieceAH == h && _pieceFmt == fmt) return _pieceA;
     if (_pieceA) { CVPixelBufferRelease(_pieceA); _pieceA = NULL; }
@@ -821,8 +796,7 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     _pieceBW = w; _pieceBH = h; _pieceFmt = fmt;
     return _pieceB;
 }
-
-// [FIX-5] 背景铺满 + 前景覆盖：方向键移动/缩放后露出区域 = 视频自身像素
+// [模糊背景] 源帧 1/8 小图 → Normal 放大 = 低分辨率模糊，前景清晰覆盖
 - (CVPixelBufferRef)bakeTransform:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
     if (!input) return NULL;
     BOOL noTransform = (fabs(_zoom - 1.0) < 0.001 && _panX == 0.0 && _panY == 0.0);
@@ -836,34 +810,39 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     vcamCopyAttachments(input, canvas);
 
-    // [FIX-5] 背景：源帧 crop fill 铺满 canvas
-    if (!_bgBuf || _bgW != W || _bgH != H || _bgFmt != fmt) {
-        if (_bgBuf) CVPixelBufferRelease(_bgBuf);
-        _bgBuf = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, W, H, fmt, NULL, &_bgBuf);
-        _bgW = W; _bgH = H; _bgFmt = fmt;
-    }
-    if (_bgBuf) {
-        VTPixelTransferSessionRef bgSess = (fmt == '420f' || fmt == '420v') ? _yuv : _bgra;
-        if (bgSess && VTPixelTransferSessionTransferImage(bgSess, input, _bgBuf) == noErr) {
-            CVPixelBufferLockBaseAddress(_bgBuf, kCVPixelBufferLock_ReadOnly);
-            CVPixelBufferLockBaseAddress(canvas, 0);
-            for (int p = 0; p < 2; p++) {
-                uint8_t *sb = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(_bgBuf, p);
-                uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(canvas, p);
-                if (!sb || !db) continue;
-                size_t srs = CVPixelBufferGetBytesPerRowOfPlane(_bgBuf, p);
-                size_t drs = CVPixelBufferGetBytesPerRowOfPlane(canvas, p);
-                size_t rows = (p == 0) ? H : H / 2;
-                size_t rb = MIN(srs, drs);
-                for (size_t y = 0; y < rows; y++) memcpy(db + y * drs, sb + y * srs, rb);
-            }
-            CVPixelBufferUnlockBaseAddress(canvas, 0);
-            CVPixelBufferUnlockBaseAddress(_bgBuf, kCVPixelBufferLock_ReadOnly);
+    // 背景模糊延伸：源帧 → 1/8 小图（Normal 缩小） → canvas（Normal 放大，低分辨率=模糊）
+    BOOL bgOk = NO;
+    size_t sW = MAX(16, (W / 8) & ~1);
+    size_t sH = MAX(16, (H / 8) & ~1);
+    if (!_smallBuf || _smallW != sW || _smallH != sH || _smallFmt != fmt) {
+        if (_smallBuf) CVPixelBufferRelease(_smallBuf);
+        _smallBuf = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, sW, sH, fmt, NULL, &_smallBuf) == noErr && _smallBuf) {
+            _smallW = sW; _smallH = sH; _smallFmt = fmt;
         }
     }
+    if (_smallBuf) {
+        VTPixelTransferSessionRef normSess = [self normalSession];
+        if (normSess &&
+            VTPixelTransferSessionTransferImage(normSess, input, _smallBuf) == noErr &&
+            VTPixelTransferSessionTransferImage(normSess, _smallBuf, canvas) == noErr) {
+            bgOk = YES;
+        }
+    }
+    if (!bgOk) {
+        CVPixelBufferLockBaseAddress(canvas, 0);
+        for (int p = 0; p < 2; p++) {
+            uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(canvas, p);
+            size_t drs = CVPixelBufferGetBytesPerRowOfPlane(canvas, p);
+            size_t pw = CVPixelBufferGetWidthOfPlane(canvas, p);
+            size_t ph = CVPixelBufferGetHeightOfPlane(canvas, p);
+            uint8_t val = (p == 0) ? (fmt == '420f' ? 0 : 16) : 128;
+            if (db) for (size_t y = 0; y < ph; y++) memset(db + y * drs, val, pw);
+        }
+        CVPixelBufferUnlockBaseAddress(canvas, 0);
+    }
 
-    // 前景：窗口缩放覆盖（原逻辑，去掉清黑，保留 canvas 背景）
+    // 前景：窗口缩放覆盖在模糊背景上
     double z = _zoom < 0.5 ? 0.5 : (_zoom > 4.0 ? 4.0 : _zoom);
     double ww = W / z, wh = H / z;
     double wx = (W - ww) / 2.0 - _panX * W;
@@ -920,8 +899,7 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     }
     return canvas;
 }
-
-// 彩色注入：整段保持原样，本修复未改动
+// 彩色注入：整段保持原样
 - (void)injectLight:(CVPixelBufferRef)buf {
     if (!buf || !_lightOn || _lightColor == 0) return;
     size_t W = CVPixelBufferGetWidth(buf), H = CVPixelBufferGetHeight(buf);
@@ -1012,7 +990,6 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
         }
     }
 }
-
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
     if (!s) return NULL;
     @try { return [self _process:s targetW:tw targetH:th]; }
@@ -1131,6 +1108,7 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
 @property (nonatomic, assign) BOOL lastMirror, lastLightOn;
 @property (nonatomic, assign) uint32_t lastLightColor;
 @property (nonatomic, assign) int lastLX, lastLY, lastLI, lastLD, lastLF;
+@property (nonatomic, assign) NSInteger lastVideoVersion;
 + (instancetype)shared;
 - (void)startRender;
 - (void)startPolling;
@@ -1152,6 +1130,7 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
         _lastEn = -1; _lastRot = -1; _lastPaused = -1;
         _lastZoom = -1;
         _lastMirror = NO; _lastLightOn = NO; _lastLightColor = 0;
+        _lastVideoVersion = -1;
         BOOL isSB = [[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"];
         if (!isSB) {
             _player = [[VCPlayer alloc] init];
@@ -1206,6 +1185,7 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
         if (lf < 0 || lf > 100) lf = 100;
         BOOL paused = [pl[@"paused"] boolValue];
         NSString *path = [pl[@"activePlaybackPath"] isKindOfClass:[NSString class]] ? pl[@"activePlaybackPath"] : nil;
+        NSInteger videoVer = [pl[@"vcamVideoVersion"] integerValue];
         BOOL enChanged = (en != _lastEn);
         BOOL rotChanged = (rot != _lastRot);
         BOOL mirrorChanged = (mirror != _lastMirror);
@@ -1228,7 +1208,14 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
             [_renderLock unlock];
         }
         if (enChanged && _enabled) [_player start];
-        if (path && ![path isEqualToString:_player.path]) [_player load:path];
+        // 视频版本检测：同一路径重新选视频（覆盖 vcam.mp4）也要 reload
+        BOOL verChanged = (videoVer != _lastVideoVersion);
+        if (path && (verChanged || ![path isEqualToString:_player.path])) {
+            [_player load:path];
+            _lastVideoVersion = videoVer;
+            vcamLog([NSString stringWithFormat:@"[vcam] player reload: %@ ver=%ld",
+                     path.lastPathComponent, (long)videoVer]);
+        }
         if (paused != _lastPaused) { _lastPaused = paused; _player.paused = paused; }
     } @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"poll exception: %@", e]); }
 }
@@ -1237,8 +1224,6 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     @try { [self _renderInto:pb pts:pts]; }
     @catch (NSException *e) { vcamLog([NSString stringWithFormat:@"renderInto exception: %@", e]); }
 }
-
-// [FIX-6] 图片模式分发 + [FIX-4] 失败不写相机 buffer
 - (void)_renderInto:(CVPixelBufferRef)pb pts:(double)pts {
     [_dedupLock lock];
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -1249,16 +1234,19 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     [_dedupLock unlock];
     if (dup) return;
 
-    // [FIX-6] 图片模式：走 VCImageStore（无缩放、无绿边）
     NSDictionary *pl = plRead();
     NSString *mediaType = pl[@"vcamSlotMediaType"];
     if ([mediaType isEqualToString:@"image"]) {
         NSString *imgPath = pl[@"vcamActiveImagePath"];
         int ver = [pl[@"vcamImageVersion"] intValue];
         int rot = (int)[pl[@"manualRotation"] integerValue];
+        double ipx = [pl[@"userPanX"] doubleValue];
+        double ipy = [pl[@"userPanY"] doubleValue];
+        double iz  = [pl[@"userZoom"] doubleValue];
+        if (iz <= 0) iz = 1.0;
         if ([imgPath isKindOfClass:[NSString class]] && imgPath.length > 0) {
             [[VCImageStore shared] syncWithPath:imgPath version:ver rotation:rot];
-            if ([[VCImageStore shared] replaceCameraBuffer:pb]) return;
+            if ([[VCImageStore shared] replaceCameraBuffer:pb panX:ipx panY:ipy zoom:iz]) return;
         }
     }
 
@@ -1290,7 +1278,6 @@ static void (*origEmit)(id, SEL, CMSampleBufferRef);
 static void (*origScaler)(id, SEL, CMSampleBufferRef, id);
 static void (*origEncoder)(id, SEL, CMSampleBufferRef, id);
 
-// [FIX-1] 格式守卫：只处理 VCProc 确定支持的格式，其他保持相机原样
 static void processSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (!sb) return;
     @try {
@@ -1374,15 +1361,12 @@ static void vcamBallLog(NSString *m) {
         } @catch (NSException *e) {}
     }
 }
-
-// [FIX-7] 深绿 65% + 绿色发光 + 按钮配套配色
 static UIColor *CBgDeep(void)    { return [UIColor colorWithRed:0.00 green:0.188 blue:0.125 alpha:0.65]; }
 static UIColor *CBtnBg(void)     { return [UIColor colorWithRed:0.00 green:0.275 blue:0.188 alpha:0.80]; }
 static UIColor *CBtnBorder(void) { return [UIColor colorWithRed:0.486 green:1.00 blue:0.698 alpha:0.40]; }
 static UIColor *CTextMain(void)  { return [UIColor colorWithRed:0.875 green:1.00 blue:0.933 alpha:1.0]; }
 static UIColor *CGlow(void)      { return [UIColor colorWithRed:0.486 green:1.00 blue:0.698 alpha:1.0]; }
 static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 blue:0.02 alpha:1.0]; }
-
 
 @interface VCOverlayWindow : UIWindow @end
 @implementation VCOverlayWindow
@@ -1393,7 +1377,6 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
 }
 @end
 
-// [FIX-7] 悬浮球：玻璃透明 + SQKJ + ¥ + 绿色发光
 @interface VCBallView : UIView
 @property (nonatomic, strong) UILabel *mainLabel;
 @property (nonatomic, strong) UILabel *yenLabel;
@@ -1407,7 +1390,6 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
         self.layer.masksToBounds = NO;
         self.layer.borderWidth = 1;
         self.layer.borderColor = CBtnBorder().CGColor;
-
         UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
         blur.frame = self.bounds;
         blur.layer.cornerRadius = f.size.width / 2;
@@ -1419,7 +1401,6 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
         tint.layer.cornerRadius = f.size.width / 2;
         tint.userInteractionEnabled = NO;
         [self addSubview:tint];
-
         _mainLabel = [[UILabel alloc] initWithFrame:CGRectMake(4, f.size.height*0.30, f.size.width-8, f.size.height*0.34)];
         _mainLabel.text = @"SQKJ";
         _mainLabel.textAlignment = NSTextAlignmentCenter;
@@ -1430,7 +1411,6 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
         _mainLabel.layer.shadowOpacity = 0.9;
         _mainLabel.layer.shadowOffset = CGSizeZero;
         [self addSubview:_mainLabel];
-
         _yenLabel = [[UILabel alloc] initWithFrame:CGRectMake(f.size.width-22, 6, 18, 18)];
         _yenLabel.text = @"¥";
         _yenLabel.textAlignment = NSTextAlignmentCenter;
@@ -1536,7 +1516,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         return;
     }
     _buildRetries = 0;
-
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
@@ -1555,19 +1534,18 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _win.rootViewController = [[UIViewController alloc] init];
     _win.hidden = NO;
     _win.userInteractionEnabled = YES;
-
     CGFloat bs = 64;
     CGFloat bx = sb.size.width - bs - 20;
     CGFloat by = sb.size.height / 2 - bs / 2;
     _ball = [[VCBallView alloc] initWithFrame:CGRectMake(bx, by, bs, bs)];
     [_ball addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ballTap)]];
     [_ball addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(ballDrag:)]];
-
     [self buildPanel];
     [_win addSubview:_ball];
 }
 - (void)buildPanel {
-    CGFloat pw = 250, ph = 380, pad = 12;
+    // 面板高度 440（含彩色注入按钮完整可见）
+    CGFloat pw = 250, ph = 440, pad = 12;
     _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     _panel.backgroundColor = CBgDeep();
     _panel.layer.borderWidth = 1;
@@ -1601,8 +1579,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [self refreshVisuals];
     [_win addSubview:_panel];
 }
-
-// [FIX-7] 控制页：整行按钮 30 高，方向键 3×3 单键 44×44
+// 控制页：整行按钮 30 高，方向键 3×3，单键 44×44（下箭头底行独立，不与"复"重叠）
 - (void)buildCtrlPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
     CGFloat y = 0, btnH = 30, gap = 8;
     [page addSubview:makeRetroBtn(@"选择 视频/图片", CGRectMake(pad, y, contentW, btnH), self, @selector(pickMedia))]; y += btnH + gap;
@@ -1612,21 +1589,22 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [page addSubview:makeIconBtn(@"arrow.clockwise", CGRectMake(pad, y, halfW, btnH), self, @selector(rotate))];
     _playBtn = makeIconBtn(@"pause.fill", CGRectMake(pad + halfW + gap, y, halfW, btnH), self, @selector(togglePause));
     [page addSubview:_playBtn]; y += btnH + gap;
-
     CGFloat cell = 44, dg = 4;
     CGFloat dpadW = cell * 3 + dg * 2;
     CGFloat startX = pad + (contentW - dpadW) / 2;
+    // 顶行：上箭头
     UIButton *up = makeIconBtn(@"arrow.up", CGRectMake(startX + cell + dg, y, cell, cell), self, @selector(panUp));
-    UIButton *dn = makeIconBtn(@"arrow.down", CGRectMake(startX + cell + dg, y + cell + dg, cell, cell), self, @selector(panDown));
+    // 中行：左 / 复 / 右
     UIButton *lf = makeIconBtn(@"arrow.left", CGRectMake(startX, y + cell + dg, cell, cell), self, @selector(panLeft));
-    UIButton *rt = makeIconBtn(@"arrow.right", CGRectMake(startX + (cell + dg) * 2, y + cell + dg, cell, cell), self, @selector(panRight));
     UIButton *rs = makeRetroBtn(@"复", CGRectMake(startX + cell + dg, y + cell + dg, cell, cell), self, @selector(resetTransform));
+    UIButton *rt = makeIconBtn(@"arrow.right", CGRectMake(startX + (cell + dg) * 2, y + cell + dg, cell, cell), self, @selector(panRight));
+    // 底行：下箭头（y + (cell + dg) * 2，与"复"错开一行）
+    UIButton *dn = makeIconBtn(@"arrow.down", CGRectMake(startX + cell + dg, y + (cell + dg) * 2, cell, cell), self, @selector(panDown));
     up.layer.borderColor = CGlow().CGColor; up.layer.borderWidth = 2;
     dn.layer.borderColor = CGlow().CGColor; dn.layer.borderWidth = 2;
     up.tintColor = CGlow(); dn.tintColor = CGlow();
-    [page addSubview:up]; [page addSubview:dn]; [page addSubview:lf]; [page addSubview:rt]; [page addSubview:rs];
+    [page addSubview:up]; [page addSubview:lf]; [page addSubview:rs]; [page addSubview:rt]; [page addSubview:dn];
     y += cell * 3 + dg * 2 + gap;
-
     CGFloat thirdW = (contentW - gap * 2) / 3;
     [page addSubview:makeIconBtn(@"minus", CGRectMake(pad, y, thirdW, btnH), self, @selector(zoomOut))];
     [page addSubview:makeIconBtn(@"plus",  CGRectMake(pad + thirdW + gap, y, thirdW, btnH), self, @selector(zoomIn))];
@@ -1635,7 +1613,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _lightBtn = makeRetroBtn(@"彩色注入 · OFF", CGRectMake(pad, y, contentW, btnH), self, @selector(toggleLight));
     [page addSubview:_lightBtn];
 }
-
 - (void)buildLightPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
     _colorBtns = [NSMutableArray array];
     _sliders = [NSMutableArray array];
@@ -1784,8 +1761,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     UIImage *img = [UIImage systemImageNamed:(_paused ? @"play.fill" : @"pause.fill") withConfiguration:cfg];
     [_playBtn setImage:img forState:UIControlStateNormal];
 }
-
-// [FIX-6] 一个按钮选图片/视频
 - (void)pickMedia {
     dispatch_async(dispatch_get_main_queue(), ^{
         PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
@@ -1842,9 +1817,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         NSError *cp = nil;
         if ([fm copyItemAtPath:url.path toPath:dst error:&cp]) {
             dispatch_async(dispatch_get_main_queue(), ^{
+                NSDictionary *pl = plRead();
+                int ver = [pl[@"vcamVideoVersion"] intValue] + 1;
                 plSetMany(@{@"activePlaybackPath": dst,
                             @"enabled": @YES,
-                            @"vcamSlotMediaType": @"video"});
+                            @"paused": @NO,
+                            @"vcamSlotMediaType": @"video",
+                            @"vcamVideoVersion": @(ver)});
                 [self refreshVisuals];
                 [self toast:@"视频已载入"];
             });
