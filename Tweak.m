@@ -97,6 +97,28 @@ static void plSetMany(NSDictionary *kv) {
     [d writeToFile:kPlist atomically:YES];
 }
 
+// ======================= 心率计算（仅 UI 显示用，不参与注入）=======================
+static CGFloat gVesselBpm = 68.0;
+static CGFloat gVesselBpmTarget = 68.0;
+static CGFloat gVesselPhase = 0.0;
+static CFAbsoluteTime gVesselLastShift = 0.0;
+static CFAbsoluteTime gVesselLastTime = 0.0;
+
+static CGFloat vessel_autoBpm(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gVesselLastShift == 0.0 || now >= gVesselLastShift) {
+        gVesselBpmTarget = 68.0 + ((CGFloat)(arc4random_uniform(1200)) / 100.0 - 6.0);
+        gVesselLastShift = now + 5.0 + (CGFloat)(arc4random_uniform(500)) / 100.0;
+    }
+    gVesselBpm += (gVesselBpmTarget - gVesselBpm) * 0.02;
+    if (gVesselLastTime == 0.0) gVesselLastTime = now;
+    CGFloat dt = now - gVesselLastTime;
+    gVesselLastTime = now;
+    gVesselPhase += 2.0 * M_PI * (gVesselBpm / 60.0) * dt;
+    if (gVesselPhase > 1000.0) gVesselPhase -= 1000.0;
+    return gVesselBpm;
+}
+
 // ======================= 颜色解析（从 plist 取色）=======================
 static void vessel_resolveColor(CGFloat *r, CGFloat *g, CGFloat *b) {
     NSDictionary *pl = plRead();
@@ -646,17 +668,17 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @end
 
 // ======================= 参考源码1 彩色注入状态 =======================
-static CGRect gLastFaceRect = CGRectZero;
+static CGRect gLastFaceRect;                     // 零初始化 == CGRectZero
 static uint64_t gLastFaceTime = 0;
 static CGPathRef gLastFaceContourPath = NULL;
 static VNFaceObservation *sLastObs = nil;
 
-// 从 contour path 创建灰度 mask（照搬参考源码1）
+// 从 contour path 创建灰度 mask（照搬参考源码1，cast 修复）
 static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
     size_t w = (size_t)extent.size.width, h = (size_t)extent.size.height;
     if (w < 4 || h < 4) return nil;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w, cs, kCGImageAlphaNone);
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w, cs, (CGBitmapInfo)kCGImageAlphaNone);
     CGColorSpaceRelease(cs);
     if (!ctx) return nil;
     CGContextSetFillColorWithColor(ctx, [UIColor blackColor].CGColor);
@@ -976,12 +998,7 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
     return canvas;
 }
 
-// ======================= 血管功能 → 参考源码1 彩色注入 =======================
-// 完全照搬参考源码1 的 vcam_applyColorInject 逻辑：
-// - Vision VNDetectFaceLandmarksRequest 检测
-// - mode 0: 用 faceContour 做 mask；mode 1 / 无 contour: CIRadialGradient 做 mask
-// - CIBlendWithMask 混合
-// 参数来自 plist（lightColor/lightEnabled）+ 参考源码1 默认值（alpha=0.35, diameter=0.50, offX/Y=0, mode=0）
+// ======================= 彩色注入（完全照搬参考源码1 逻辑）=======================
 - (void)injectVesselFlow:(CVPixelBufferRef)buf {
     if (!buf) return;
 
@@ -997,11 +1014,21 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
     CGFloat gInjectOffY = 0.0;
     int gInjectMode = 0;
 
-    CIImage *img = [CIImage imageWithCVPixelBuffer:buf
+    static CIContext *sCtx = nil;
+    if (!sCtx) sCtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+
+    // 关键：先把 buf 固化成 CGImage，避免后续 render 回同一 buf 造成读写冲突
+    CIImage *raw = [CIImage imageWithCVPixelBuffer:buf
                                           options:@{kCIImageColorSpace:[NSNull null]}];
-    if (!img) return;
-    CGRect ext = img.extent;
+    if (!raw) return;
+    CGRect ext = raw.extent;
     if (ext.size.width < 4 || ext.size.height < 4) return;
+
+    CGImageRef cg = [sCtx createCGImage:raw fromRect:ext];
+    if (!cg) return;
+    CIImage *img = [CIImage imageWithCGImage:cg];
+    CGImageRelease(cg);
+    if (!img) return;
 
     static int sDetectSkip = 0;
     CGRect faceRect = gLastFaceRect;
@@ -1096,8 +1123,6 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
     if (!result) return;
 
     // 渲染回 pixel buffer
-    static CIContext *sCtx = nil;
-    if (!sCtx) sCtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
     [sCtx render:result toCVPixelBuffer:buf];
 }
 
@@ -1702,7 +1727,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _panel.hidden = YES;
     _panel.alpha = 0;
 
-    // 面板左上角颜色指示器
     _colorIndicator = [[UIView alloc] initWithFrame:CGRectMake(10, 12, 20, 20)];
     _colorIndicator.layer.cornerRadius = 10;
     _colorIndicator.layer.borderWidth = 2;
@@ -1836,7 +1860,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         @"vesselFlowEnabled": @(next),
         @"lightEnabled": @(next),
     } mutableCopy];
-    if (next) kv[@"enabled"] = @YES; // 自动开替换
+    if (next) kv[@"enabled"] = @YES;
     plSetMany(kv);
     if (next) [self startColorSampling];
     else [self stopColorSampling];
@@ -1848,7 +1872,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     NSDictionary *pl = plRead();
     BOOL on = [pl[@"vesselFlowEnabled"] boolValue];
 
-    // 自动启停吸色器
     if (on && !_colorSampleTimer) {
         [self startColorSampling];
         vcamLog(@"[vcam] auto-start color sampling (vessel ON)");
@@ -1857,7 +1880,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         vcamLog(@"[vcam] auto-stop color sampling (vessel OFF)");
     }
 
-    // 更新面板左上角颜色圈
     if (_colorIndicator) {
         _colorIndicator.hidden = !on;
         uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
@@ -1891,7 +1913,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     l2.text = faceLocked ? @"● 人脸 已锁定" : @"● 人脸 未检测";
     l2.textColor = faceLocked ? [UIColor systemGreenColor] : [UIColor systemGrayColor];
 
-    // 强制调用计算函数，让心率跳动
     CGFloat curBpm = vessel_autoBpm();
     l3.text = [NSString stringWithFormat:@"♥ 心率 %d bpm（自动）", (int)curBpm];
     l3.textColor = CTextMain();
@@ -1966,7 +1987,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
             if (sat > bSat) { bSat=sat; bR=eR; bG=eG; bB=eB; }
         }
         CGColorSpaceRelease(cs);
-        
+
         CGFloat r=0,g=0,b=0;
         BOOL valid = NO;
         if (tW > 0.3) { r=tR/tW; g=tG/tW; b=tB/tW; valid = YES; }
