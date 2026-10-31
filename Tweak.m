@@ -1,6 +1,6 @@
 //
 //  Tweak.m
-//  VCamPlus · 血管仿生全自动版 (修复渲染与检测)
+//  VCamPlus · 参考源码1 彩色注入版
 //
 
 #import <Foundation/Foundation.h>
@@ -18,6 +18,8 @@
 #import <math.h>
 #import <string.h>
 #import <mach-o/dyld.h>
+#include <mach/mach_time.h>
+#import <Vision/Vision.h>
 
 // ======================= 日志 =======================
 static BOOL vcamLogOn(void) {
@@ -95,37 +97,7 @@ static void plSetMany(NSDictionary *kv) {
     [d writeToFile:kPlist atomically:YES];
 }
 
-// ======================= 血管仿生 · 全局状态 =======================
-static CGFloat gVesselBpm = 68.0;
-static CGFloat gVesselBpmTarget = 68.0;
-static CGFloat gVesselPhase = 0.0;
-static CFAbsoluteTime gVesselLastShift = 0.0;
-static CFAbsoluteTime gVesselLastTime = 0.0;
-
-static CGFloat vessel_autoBpm(void) {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (gVesselLastShift == 0.0 || now >= gVesselLastShift) {
-        gVesselBpmTarget = 68.0 + ((CGFloat)(arc4random_uniform(1200)) / 100.0 - 6.0);
-        gVesselLastShift = now + 5.0 + (CGFloat)(arc4random_uniform(500)) / 100.0;
-    }
-    gVesselBpm += (gVesselBpmTarget - gVesselBpm) * 0.02;
-    if (gVesselLastTime == 0.0) gVesselLastTime = now;
-    CGFloat dt = now - gVesselLastTime;
-    gVesselLastTime = now;
-    gVesselPhase += 2.0 * M_PI * (gVesselBpm / 60.0) * dt;
-    if (gVesselPhase > 1000.0) gVesselPhase -= 1000.0;
-    return gVesselBpm;
-}
-static CGFloat vessel_pulse(void) {
-    vessel_autoBpm();
-    return 0.85 + 0.15 * sin(gVesselPhase);
-}
-static CGFloat vessel_autoIntensity(void) {
-    CGFloat luma = [plRead()[@"lightLuma"] doubleValue];
-    if (luma <= 0.01) luma = 0.5;
-    CGFloat v = 0.25 + luma * 0.65;
-    return v < 0.25 ? 0.25 : (v > 0.8 ? 0.8 : v);
-}
+// ======================= 颜色解析（从 plist 取色）=======================
 static void vessel_resolveColor(CGFloat *r, CGFloat *g, CGFloat *b) {
     NSDictionary *pl = plRead();
     uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
@@ -673,6 +645,33 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 }
 @end
 
+// ======================= 参考源码1 彩色注入状态 =======================
+static CGRect gLastFaceRect = CGRectZero;
+static uint64_t gLastFaceTime = 0;
+static CGPathRef gLastFaceContourPath = NULL;
+static VNFaceObservation *sLastObs = nil;
+
+// 从 contour path 创建灰度 mask（照搬参考源码1）
+static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
+    size_t w = (size_t)extent.size.width, h = (size_t)extent.size.height;
+    if (w < 4 || h < 4) return nil;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w, cs, kCGImageAlphaNone);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return nil;
+    CGContextSetFillColorWithColor(ctx, [UIColor blackColor].CGColor);
+    CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
+    CGContextSetFillColorWithColor(ctx, [UIColor whiteColor].CGColor);
+    CGContextAddPath(ctx, contourPath);
+    CGContextFillPath(ctx);
+    CGImageRef cgImg = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    if (!cgImg) return nil;
+    CIImage *mask = [CIImage imageWithCGImage:cgImg];
+    CGImageRelease(cgImg);
+    return mask;
+}
+
 // ======================= 图像处理 =======================
 @interface VCProc : NSObject
 @property (nonatomic, assign) VTPixelTransferSessionRef bgra, yuv, priv, normal;
@@ -704,11 +703,8 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @property (nonatomic, assign) BOOL lastMirror;
 @property (nonatomic, assign) int cacheHitCount;
 
-// 血管仿生
+// 彩色注入开关
 @property (nonatomic, assign) BOOL vesselFlowEnabled;
-@property (nonatomic, strong) CIDetector *faceDetector;
-@property (nonatomic, assign) CGRect cachedFaceRect;
-@property (nonatomic, assign) int faceDetectSkip;
 
 - (instancetype)init;
 - (BOOL)transfer:(CVPixelBufferRef)s to:(CVPixelBufferRef)d;
@@ -750,8 +746,6 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         _s1Session = NULL;
         _cacheHitCount = 0;
         _vesselFlowEnabled = NO;
-        _cachedFaceRect = CGRectZero;
-        _faceDetectSkip = 0;
     }
     return self;
 }
@@ -982,154 +976,129 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     return canvas;
 }
 
-// ======================= 血管仿生渲染 =======================
-// 纯色双颊漫反射渐变，彻底废弃丑陋的网格纹理
+// ======================= 血管功能 → 参考源码1 彩色注入 =======================
+// 完全照搬参考源码1 的 vcam_applyColorInject 逻辑：
+// - Vision VNDetectFaceLandmarksRequest 检测
+// - mode 0: 用 faceContour 做 mask；mode 1 / 无 contour: CIRadialGradient 做 mask
+// - CIBlendWithMask 混合
+// 参数来自 plist（lightColor/lightEnabled）+ 参考源码1 默认值（alpha=0.35, diameter=0.50, offX/Y=0, mode=0）
 - (void)injectVesselFlow:(CVPixelBufferRef)buf {
     if (!buf) return;
-    CGFloat cr, cg, cb;
-    vessel_resolveColor(&cr, &cg, &cb);
-    if (cr < 0.01 && cg < 0.01 && cb < 0.01) return;
 
-    size_t W = CVPixelBufferGetWidth(buf), H = CVPixelBufferGetHeight(buf);
-    if (W < 64 || H < 64 || CVPixelBufferGetPlaneCount(buf) != 2) return;
-    if ((W & 1) || (H & 1)) return;
+    // 从 plist 取色
+    CGFloat gInjectR = 0, gInjectG = 0, gInjectB = 0;
+    vessel_resolveColor(&gInjectR, &gInjectG, &gInjectB);
+    if (gInjectR < 0.01 && gInjectG < 0.01 && gInjectB < 0.01) return;
 
-    if (!_faceDetector) {
-        @try {
-            _faceDetector = [CIDetector detectorOfType:CIDetectorTypeFace context:nil
-                            options:@{CIDetectorAccuracy: CIDetectorAccuracyLow}];
-            vcamLog([NSString stringWithFormat:@"[vcam] CIDetector init: %@", _faceDetector ? @"OK" : @"FAIL"]);
-        } @catch (NSException *e) { _faceDetector = nil; }
-    }
-    // [修复1] 复用 CIContext，用于把 YUV 420f 转 BGRA 再喂 CIDetector
-    static CIContext *sFaceCtx = nil;
-    if (!sFaceCtx) {
-        sFaceCtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-    }
-    if (_faceDetectSkip <= 0) {
-        _faceDetectSkip = 3;
-        if (_faceDetector && sFaceCtx) {
-            @try {
-                CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
-                CIImage *ci = [CIImage imageWithCVPixelBuffer:buf options:@{kCIImageColorSpace:[NSNull null]}];
-                CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
-                // [修复1] YUV 420f 直喂 CIDetector 检测率极低，先转 BGRA
-                CGImageRef cg = ci ? [sFaceCtx createCGImage:ci fromRect:ci.extent] : NULL;
-                CIImage *bgraCI = cg ? [CIImage imageWithCGImage:cg] : nil;
-                if (cg) CGImageRelease(cg);
-                if (bgraCI) {
-                    NSArray *faces = [_faceDetector featuresInImage:bgraCI];
-                    static int sFaceLogCount = 0;
-                    if (sFaceLogCount < 10) {
-                        sFaceLogCount++;
-                        vcamLog([NSString stringWithFormat:@"[vcam] CIDetector found %d faces", (int)faces.count]);
-                    }
-                    if (faces.count > 0) {
-                        CGRect fb = ((CIFaceFeature *)faces[0]).bounds;
-                        _cachedFaceRect = CGRectMake(fb.origin.x,
-                            (CGFloat)H - fb.origin.y - fb.size.height,
-                            fb.size.width, fb.size.height);
-                        if (![plRead()[@"vesselFaceLocked"] boolValue]) {
-                            plSet(@"vesselFaceLocked", @YES);
+    // 参考源码1 参数默认值
+    CGFloat gInjectAlpha = 0.35;
+    CGFloat gInjectDiameter = 0.50;
+    CGFloat gInjectOffX = 0.0;
+    CGFloat gInjectOffY = 0.0;
+    int gInjectMode = 0;
+
+    CIImage *img = [CIImage imageWithCVPixelBuffer:buf
+                                          options:@{kCIImageColorSpace:[NSNull null]}];
+    if (!img) return;
+    CGRect ext = img.extent;
+    if (ext.size.width < 4 || ext.size.height < 4) return;
+
+    static int sDetectSkip = 0;
+    CGRect faceRect = gLastFaceRect;
+
+    if (sDetectSkip <= 0 || CGRectIsEmpty(faceRect)) {
+        @autoreleasepool {
+            VNDetectFaceLandmarksRequest *req = [[VNDetectFaceLandmarksRequest alloc] init];
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCIImage:img options:@{}];
+            [handler performRequests:@[req] error:nil];
+            NSArray<VNFaceObservation *> *results = req.results;
+
+            if (results.count > 0) {
+                sLastObs = results[0];
+                CGRect bbox = sLastObs.boundingBox;
+                CGFloat imgW = ext.size.width, imgH = ext.size.height;
+                CGFloat bx = bbox.origin.x * imgW, by = bbox.origin.y * imgH;
+                CGFloat bw = bbox.size.width * imgW, bh = bbox.size.height * imgH;
+                CGFloat cx = bx + bw * 0.5 + gInjectOffX * bw;
+                CGFloat cy = by + bh * 0.5 + gInjectOffY * bh;
+                CGFloat nw = bw * gInjectDiameter * 2, nh = bh * gInjectDiameter * 2;
+                faceRect = CGRectMake(cx - nw * 0.5, cy - nh * 0.5, nw, nh);
+                faceRect = CGRectIntersection(faceRect, ext);
+                gLastFaceRect = faceRect;
+                gLastFaceTime = mach_absolute_time();
+
+                if (gInjectMode == 0 && sLastObs.landmarks.faceContour) {
+                    VNFaceLandmarkRegion2D *contour = sLastObs.landmarks.faceContour;
+                    const CGPoint *pts = [contour pointsInImageOfSize:ext.size];
+                    if (pts && contour.pointCount > 2) {
+                        CGMutablePathRef path = CGPathCreateMutable();
+                        CGFloat bcx = (bbox.origin.x + bbox.size.width * 0.5) * imgW;
+                        CGFloat bcy = (bbox.origin.y + bbox.size.height * 0.5) * imgH;
+                        for (NSUInteger i = 0; i < contour.pointCount; i++) {
+                            CGFloat px = bcx + (pts[i].x - bcx) * gInjectDiameter * 2 + gInjectOffX * bw;
+                            CGFloat py = bcy + (pts[i].y - bcy) * gInjectDiameter * 2 + gInjectOffY * bh;
+                            if (i == 0) CGPathMoveToPoint(path, NULL, px, py);
+                            else CGPathAddLineToPoint(path, NULL, px, py);
                         }
-                    } else {
-                        if ([plRead()[@"vesselFaceLocked"] boolValue]) {
-                            plSet(@"vesselFaceLocked", @NO);
-                        }
+                        CGPathCloseSubpath(path);
+                        if (gLastFaceContourPath) CGPathRelease(gLastFaceContourPath);
+                        gLastFaceContourPath = path;
                     }
                 }
-            } @catch (NSException *e) {}
+                if (![plRead()[@"vesselFaceLocked"] boolValue]) plSet(@"vesselFaceLocked", @YES);
+                vcamLog(@"[vcam] Vision face OK");
+            } else {
+                mach_timebase_info_data_t tbi;
+                mach_timebase_info(&tbi);
+                uint64_t elapsed = (mach_absolute_time() - gLastFaceTime) * tbi.numer / tbi.denom;
+                if (elapsed > 500000000ULL) {
+                    gLastFaceRect = CGRectZero;
+                    if ([plRead()[@"vesselFaceLocked"] boolValue]) plSet(@"vesselFaceLocked", @NO);
+                    return;
+                }
+            }
         }
-    } else _faceDetectSkip--;
-
-    CGRect fr = _cachedFaceRect;
-    if (CGRectIsEmpty(fr)) return; // 严格拦截：没人脸绝对不画！
-
-    CGFloat pulse = vessel_pulse();
-    CGFloat intensity = vessel_autoIntensity();
-    CGFloat fw = fr.size.width, fh = fr.size.height;
-    CGFloat cx = fr.origin.x + fw * 0.5, cy = fr.origin.y + fh * 0.5;
-    
-    // 双颊半径稍微收小一点，让中心更聚焦
-    CGFloat rx = fw * 0.30, ry = fh * 0.28;
-    CGFloat lcx = cx - rx * 0.8, lcy = cy - ry * 0.1;
-    CGFloat rcx = cx + rx * 0.8, rcy = cy - ry * 0.1;
-
-    uint8_t cyV = (uint8_t)((299*cr*255 + 587*cg*255 + 114*cb*255) / 1000);
-    uint8_t cuV = (uint8_t)((-169*cr*255 - 331*cg*255 + 500*cb*255) / 1000 + 128);
-    uint8_t cvV = (uint8_t)(( 500*cr*255 - 419*cg*255 -  81*cb*255) / 1000 + 128);
-
-    CGFloat alphaBase = intensity * pulse;
-    uint8_t *yp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 0);
-    uint8_t *cp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 1);
-    size_t ys = CVPixelBufferGetBytesPerRowOfPlane(buf, 0);
-    size_t cs = CVPixelBufferGetBytesPerRowOfPlane(buf, 1);
-    if (!yp || !cp) return;
-
-    int y0 = MAX((int)(cy - fh * 0.5), 0), y1 = MIN((int)(cy + fh * 0.5), (int)H);
-    int x0 = MAX((int)(cx - fw * 0.5), 0), x1 = MIN((int)(cx + fw * 0.5), (int)W);
-    
-    // Y 平面渲染 (平滑漫反射)
-    for (int y = y0; y < y1; y++) {
-        uint8_t *row = yp + (size_t)y * ys;
-        for (int x = x0; x < x1; x++) {
-            // 椭圆边界衰减，保证不出脸框
-            CGFloat dxF = (x - cx) / (fw * 0.5), dyF = (y - cy) / (fh * 0.5);
-            CGFloat ell = 1.0 - (dxF*dxF + dyF*dyF);
-            if (ell <= 0.0) continue;
-            ell = ell * ell; // 边缘更柔和
-            
-            // 双颊浓度
-            CGFloat dl2 = (x-lcx)*(x-lcx)/(rx*rx) + (y-lcy)*(y-lcy)/(ry*ry);
-            CGFloat cl = dl2 < 1.0 ? (1.0 - dl2) : 0.0;
-            CGFloat dr2 = (x-rcx)*(x-rcx)/(rx*rx) + (y-rcy)*(y-rcy)/(ry*ry);
-            CGFloat cr2 = dr2 < 1.0 ? (1.0 - dr2) : 0.0;
-            
-            CGFloat cheek = MAX(cl, cr2);
-            if (cheek <= 0.0) continue;
-            
-            CGFloat a = alphaBase * cheek * ell;
-            if (a <= 0.01) continue;
-            if (a > 0.7) a = 0.7; // 限制最大不透明度，防止变成纯色面具
-            
-            int ai = (int)(a * 256.0); if (ai > 256) ai = 256;
-            row[x] = (uint8_t)((row[x]*(256-ai) + cyV*ai) >> 8);
-        }
+        sDetectSkip = 3;
+    } else {
+        sDetectSkip--;
     }
 
-    // CbCr 半分辨率渲染
-    CGFloat cxc = cx/2, cyc = cy/2, rxc = rx/2, ryc = ry/2;
-    CGFloat lcxc = lcx/2, lcyc = lcy/2, rcxc = rcx/2, rcyc = rcy/2;
-    CGFloat fwc = fw/2, fhc = fh/2;
-    int yc0 = MAX((int)(cyc - fhc*0.5), 0), yc1 = MIN((int)(cyc + fhc*0.5), (int)(H/2));
-    int xc0 = MAX((int)(cxc - fwc*0.5), 0), xc1 = MIN((int)(cxc + fwc*0.5), (int)(W/2));
-    
-    for (int y = yc0; y < yc1; y++) {
-        uint8_t *row = cp + (size_t)y * cs;
-        for (int x = xc0; x < xc1; x++) {
-            CGFloat dxF = (x-cxc)/(fwc*0.5), dyF = (y-cyc)/(fhc*0.5);
-            CGFloat ell = 1.0 - (dxF*dxF + dyF*dyF);
-            if (ell <= 0.0) continue; 
-            ell = ell * ell;
-            
-            CGFloat dl2 = (x-lcxc)*(x-lcxc)/(rxc*rxc) + (y-lcyc)*(y-lcyc)/(ryc*ryc);
-            CGFloat cl = dl2 < 1.0 ? (1.0 - dl2) : 0.0;
-            CGFloat dr2 = (x-rcxc)*(x-rcxc)/(rxc*rxc) + (y-rcyc)*(y-rcyc)/(ryc*ryc);
-            CGFloat cr2 = dr2 < 1.0 ? (1.0 - dr2) : 0.0;
-            
-            CGFloat cheek = MAX(cl, cr2);
-            if (cheek <= 0.0) continue;
-            
-            CGFloat a = alphaBase * cheek * ell;
-            if (a <= 0.01) continue; 
-            if (a > 0.7) a = 0.7;
-            
-            int ai = (int)(a * 256.0); if (ai > 256) ai = 256;
-            int i = x * 2;
-            row[i]     = (uint8_t)((row[i]    *(256-ai) + cuV*ai) >> 8);
-            row[i + 1] = (uint8_t)((row[i + 1]*(256-ai) + cvV*ai) >> 8);
-        }
+    if (CGRectIsEmpty(faceRect)) return;
+
+    // 构建 mask
+    CIImage *mask = nil;
+    if (gInjectMode == 0 && gLastFaceContourPath) {
+        mask = vcam_createContourMask(gLastFaceContourPath, ext);
     }
+    if (!mask) {
+        CGFloat mcx = CGRectGetMidX(faceRect), mcy = CGRectGetMidY(faceRect);
+        CGFloat radius = MAX(faceRect.size.width, faceRect.size.height) * 0.5;
+        CIFilter *radial = [CIFilter filterWithName:@"CIRadialGradient"];
+        [radial setValue:[CIVector vectorWithX:mcx Y:mcy] forKey:@"inputCenter"];
+        [radial setValue:@(radius * 0.6) forKey:@"inputRadius0"];
+        [radial setValue:@(radius) forKey:@"inputRadius1"];
+        [radial setValue:[CIColor colorWithRed:1 green:1 blue:1 alpha:1] forKey:@"inputColor0"];
+        [radial setValue:[CIColor colorWithRed:1 green:1 blue:1 alpha:0] forKey:@"inputColor1"];
+        mask = [radial.outputImage imageByCroppingToRect:ext];
+    }
+    if (!mask) return;
+
+    // 颜色覆盖层
+    CIColor *overlayColor = [CIColor colorWithRed:gInjectR green:gInjectG blue:gInjectB alpha:gInjectAlpha];
+    CIImage *colorImg = [[CIImage imageWithColor:overlayColor] imageByCroppingToRect:ext];
+
+    // CIBlendWithMask 混合
+    CIFilter *blendMask = [CIFilter filterWithName:@"CIBlendWithMask"];
+    [blendMask setValue:colorImg forKey:kCIInputImageKey];
+    [blendMask setValue:img forKey:kCIInputBackgroundImageKey];
+    [blendMask setValue:mask forKey:@"inputMaskImage"];
+    CIImage *result = blendMask.outputImage;
+    if (!result) return;
+
+    // 渲染回 pixel buffer
+    static CIContext *sCtx = nil;
+    if (!sCtx) sCtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    [sCtx render:result toCVPixelBuffer:buf];
 }
 
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
@@ -1223,7 +1192,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     if (extra) CVPixelBufferRelease(extra);
     if (rotOwned) CVPixelBufferRelease(rot);
     if (!baked) return NULL;
-    // 血管仿生（canvas 拷贝 + 注入）
+    // 彩色注入（canvas 拷贝 + injectVesselFlow，逻辑未改）
     if (_vesselFlowEnabled && CVPixelBufferGetPlaneCount(baked) == 2) {
         size_t bw = CVPixelBufferGetWidth(baked), bh = CVPixelBufferGetHeight(baked);
         if (!(bw & 1) && !(bh & 1)) {
@@ -1243,7 +1212,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
                     for (size_t y = 0; y < rows; y++) memcpy(db + y * drs, sb + y * srs, rb);
                 }
                 CVPixelBufferUnlockBaseAddress(baked, kCVPixelBufferLock_ReadOnly);
-                CVPixelBufferUnlockBaseAddress(canvas, 0); // 提前解锁
+                CVPixelBufferUnlockBaseAddress(canvas, 0);
                 vcamCopyAttachments(baked, canvas);
                 [self injectVesselFlow:canvas];
                 CVPixelBufferRelease(baked);
@@ -1971,19 +1940,12 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         };
         CGFloat tR=0,tG=0,tB=0,tW=0, bSat=0,bR=0,bG=0,bB=0;
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        // [修复2] 计算截图像素→屏幕点的缩放比，用于跳过面板/球遮挡的采样点
-        CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
-        CGFloat pxScale = (scrW > 0) ? ((CGFloat)w / scrW) : 1.0;
         for (int e=0;e<4;e++) {
             CGFloat eR=0,eG=0,eB=0; int v=0;
             for (int k=0;k<3;k++) {
                 CGRect r = rects[e];
                 CGFloat px = r.origin.x + r.size.width*(0.2+k*0.3);
                 CGFloat py = r.origin.y + r.size.height*(0.2+k*0.3);
-                // [修复2] 跳过悬浮面板/悬浮球所在的采样点，避免污染边缘取色
-                CGPoint spt = CGPointMake(px / pxScale, py / pxScale);
-                if (_panel && !_panel.hidden && CGRectContainsPoint(_panel.frame, spt)) continue;
-                if (_ball && CGRectContainsPoint(_ball.frame, spt)) continue;
                 CGImageRef cImg = CGImageCreateWithImageInRect(cgImg, CGRectMake(px,py,1,1));
                 if (!cImg) continue;
                 unsigned char pix[4]={0};
