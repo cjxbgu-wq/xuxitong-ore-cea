@@ -1567,7 +1567,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     return b;
 }
 
-@interface VCBall : NSObject
+@interface VCBall : NSObject <PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) VCBallView *ball;
 @property (nonatomic, strong) UIView *panel;
@@ -1928,7 +1928,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
                 CGImageRef cImg = CGImageCreateWithImageInRect(cgImg, CGRectMake(px,py,1,1));
                 if (!cImg) continue;
                 unsigned char pix[4]={0};
-                CGContextRef ctx = CGBitmapContextCreate(pix,1,1,8,4,cs,kCGImageAlphaPremultipliedLast);
+                CGContextRef ctx = CGBitmapContextCreate(pix, 1, 1, 8, 4, cs,
+    (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
                 CGContextDrawImage(ctx,CGRectMake(0,0,1,1),cImg);
                 CGContextRelease(ctx); CGImageRelease(cImg);
                 eR += pix[0]/255.0; eG += pix[1]/255.0; eB += pix[2]/255.0; v++;
