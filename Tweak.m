@@ -1675,7 +1675,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
                                   self, @selector(pickMedia))];
     y += btnH + gap;
 
-    _replaceBtn = makeRetroBtn(@"替 换 · ON",
+    
                                CGRectMake
     _replaceBtn = makeRetroBtn(@"替 换 · ON",
                                CGRectMake(pad, y, contentW, btnH),
