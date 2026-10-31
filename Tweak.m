@@ -1382,10 +1382,7 @@ static UIColor *CBtnBorder(void) { return [UIColor colorWithRed:0.486 green:1.00
 static UIColor *CTextMain(void)  { return [UIColor colorWithRed:0.875 green:1.00 blue:0.933 alpha:1.0]; }
 static UIColor *CGlow(void)      { return [UIColor colorWithRed:0.486 green:1.00 blue:0.698 alpha:1.0]; }
 static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 blue:0.02 alpha:1.0]; }
-static UIColor *CGold(void)      { return CGlow(); }
-static UIColor *CGoldDk(void)    { return CBtnBorder(); }
-static UIColor *CPanel(void)     { return CBgDeep(); }
-static UIColor *CGreen(void)     { return CTextMain(); }
+
 
 @interface VCOverlayWindow : UIWindow @end
 @implementation VCOverlayWindow
