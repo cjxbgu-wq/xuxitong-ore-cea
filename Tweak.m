@@ -1,6 +1,6 @@
 //
 //  Tweak.m
-//  VCamPlus · 血管仿生全自动版
+//  VCamPlus · 血管仿生全自动版 (修复渲染与检测)
 //
 
 #import <Foundation/Foundation.h>
@@ -493,7 +493,6 @@ static CVPixelBufferRef vcamCropStaging(CVPixelBufferRef staging, CVPixelBufferR
     return *cropSlot;
 }
 
-// 边界延伸（前景覆盖后，空隙处把前景边缘像素向外拉伸）
 static void vcamExtendEdges(CVPixelBufferRef canvas,
                             long dx0, long dy0, long dx1, long dy1) {
     size_t W = CVPixelBufferGetWidth(canvas);
@@ -984,7 +983,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 }
 
 // ======================= 血管仿生渲染 =======================
-// 双颊径向渐变 + 纵向血管纹理 + 心跳脉动
+// 纯色双颊漫反射渐变，彻底废弃丑陋的网格纹理
 - (void)injectVesselFlow:(CVPixelBufferRef)buf {
     if (!buf) return;
     CGFloat cr, cg, cb;
@@ -999,20 +998,35 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         @try {
             _faceDetector = [CIDetector detectorOfType:CIDetectorTypeFace context:nil
                             options:@{CIDetectorAccuracy: CIDetectorAccuracyLow}];
+            vcamLog([NSString stringWithFormat:@"[vcam] CIDetector init: %@", _faceDetector ? @"OK" : @"FAIL"]);
         } @catch (NSException *e) { _faceDetector = nil; }
     }
     if (_faceDetectSkip <= 0) {
         _faceDetectSkip = 3;
         if (_faceDetector) {
             @try {
-                CIImage *ci = [CIImage imageWithCVPixelBuffer:buf];
+                CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+                CIImage *ci = [CIImage imageWithCVPixelBuffer:buf options:@{kCIImageColorSpace:[NSNull null]}];
+                CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
                 if (ci) {
                     NSArray *faces = [_faceDetector featuresInImage:ci];
+                    static int sFaceLogCount = 0;
+                    if (sFaceLogCount < 10) {
+                        sFaceLogCount++;
+                        vcamLog([NSString stringWithFormat:@"[vcam] CIDetector found %d faces", (int)faces.count]);
+                    }
                     if (faces.count > 0) {
                         CGRect fb = ((CIFaceFeature *)faces[0]).bounds;
                         _cachedFaceRect = CGRectMake(fb.origin.x,
                             (CGFloat)H - fb.origin.y - fb.size.height,
                             fb.size.width, fb.size.height);
+                        if (![plRead()[@"vesselFaceLocked"] boolValue]) {
+                            plSet(@"vesselFaceLocked", @YES);
+                        }
+                    } else {
+                        if ([plRead()[@"vesselFaceLocked"] boolValue]) {
+                            plSet(@"vesselFaceLocked", @NO);
+                        }
                     }
                 }
             } @catch (NSException *e) {}
@@ -1020,19 +1034,17 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     } else _faceDetectSkip--;
 
     CGRect fr = _cachedFaceRect;
-    if (CGRectIsEmpty(fr)) return;
+    if (CGRectIsEmpty(fr)) return; // 严格拦截：没人脸绝对不画！
 
     CGFloat pulse = vessel_pulse();
     CGFloat intensity = vessel_autoIntensity();
     CGFloat fw = fr.size.width, fh = fr.size.height;
     CGFloat cx = fr.origin.x + fw * 0.5, cy = fr.origin.y + fh * 0.5;
-    CGFloat rx = fw * 0.35, ry = fh * 0.30;
-    CGFloat lcx = cx - rx * 0.7, lcy = cy - ry * 0.1;
-    CGFloat rcx = cx + rx * 0.7, rcy = cy - ry * 0.1;
-    CGFloat faceRatio = fh / (CGFloat)H;
-    CGFloat density = 0.3 + faceRatio * 0.4;
-    if (density < 0.3) density = 0.3;
-    if (density > 0.5) density = 0.5;
+    
+    // 双颊半径稍微收小一点，让中心更聚焦
+    CGFloat rx = fw * 0.30, ry = fh * 0.28;
+    CGFloat lcx = cx - rx * 0.8, lcy = cy - ry * 0.1;
+    CGFloat rcx = cx + rx * 0.8, rcy = cy - ry * 0.1;
 
     uint8_t cyV = (uint8_t)((299*cr*255 + 587*cg*255 + 114*cb*255) / 1000);
     uint8_t cuV = (uint8_t)((-169*cr*255 - 331*cg*255 + 500*cb*255) / 1000 + 128);
@@ -1045,58 +1057,64 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     size_t cs = CVPixelBufferGetBytesPerRowOfPlane(buf, 1);
     if (!yp || !cp) return;
 
-    int spacing = (int)(20.0 / (density + 0.1));
-    if (spacing < 8) spacing = 8; if (spacing > 40) spacing = 40;
-
-    int y0 = MAX((int)(cy - fh * 0.6), 0), y1 = MIN((int)(cy + fh * 0.6), (int)H);
-    int x0 = MAX((int)(cx - fw * 0.6), 0), x1 = MIN((int)(cx + fw * 0.6), (int)W);
+    int y0 = MAX((int)(cy - fh * 0.5), 0), y1 = MIN((int)(cy + fh * 0.5), (int)H);
+    int x0 = MAX((int)(cx - fw * 0.5), 0), x1 = MIN((int)(cx + fw * 0.5), (int)W);
+    
+    // Y 平面渲染 (平滑漫反射)
     for (int y = y0; y < y1; y++) {
         uint8_t *row = yp + (size_t)y * ys;
         for (int x = x0; x < x1; x++) {
+            // 椭圆边界衰减，保证不出脸框
             CGFloat dxF = (x - cx) / (fw * 0.5), dyF = (y - cy) / (fh * 0.5);
             CGFloat ell = 1.0 - (dxF*dxF + dyF*dyF);
             if (ell <= 0.0) continue;
-            if (ell > 1.0) ell = 1.0;
+            ell = ell * ell; // 边缘更柔和
+            
+            // 双颊浓度
             CGFloat dl2 = (x-lcx)*(x-lcx)/(rx*rx) + (y-lcy)*(y-lcy)/(ry*ry);
-            CGFloat cl = dl2 < 1.0 ? 1.0 - dl2 : 0.0;
+            CGFloat cl = dl2 < 1.0 ? (1.0 - dl2) : 0.0;
             CGFloat dr2 = (x-rcx)*(x-rcx)/(rx*rx) + (y-rcy)*(y-rcy)/(ry*ry);
-            CGFloat cr2 = dr2 < 1.0 ? 1.0 - dr2 : 0.0;
+            CGFloat cr2 = dr2 < 1.0 ? (1.0 - dr2) : 0.0;
+            
             CGFloat cheek = MAX(cl, cr2);
-            CGFloat vn = 0.0;
-            int m = x % spacing;
-            if (m < 2) {
-                uint32_t h = (uint32_t)(x*73856093u) ^ (uint32_t)(y*19349663u);
-                vn = (2 - m) / 2.0 * (0.5 + 0.5*((h & 0xFF)/255.0));
-            }
-            CGFloat a = alphaBase * (0.5*cheek + 0.5*vn) * ell;
+            if (cheek <= 0.0) continue;
+            
+            CGFloat a = alphaBase * cheek * ell;
             if (a <= 0.01) continue;
-            if (a > 1.0) a = 1.0;
+            if (a > 0.7) a = 0.7; // 限制最大不透明度，防止变成纯色面具
+            
             int ai = (int)(a * 256.0); if (ai > 256) ai = 256;
             row[x] = (uint8_t)((row[x]*(256-ai) + cyV*ai) >> 8);
         }
     }
 
-    // CbCr 半分辨率
-    int sc = spacing / 2; if (sc < 4) sc = 4;
+    // CbCr 半分辨率渲染
     CGFloat cxc = cx/2, cyc = cy/2, rxc = rx/2, ryc = ry/2;
     CGFloat lcxc = lcx/2, lcyc = lcy/2, rcxc = rcx/2, rcyc = rcy/2;
     CGFloat fwc = fw/2, fhc = fh/2;
-    int yc0 = MAX((int)(cyc - fhc*0.6), 0), yc1 = MIN((int)(cyc + fhc*0.6), (int)(H/2));
-    int xc0 = MAX((int)(cxc - fwc*0.6), 0), xc1 = MIN((int)(cxc + fwc*0.6), (int)(W/2));
+    int yc0 = MAX((int)(cyc - fhc*0.5), 0), yc1 = MIN((int)(cyc + fhc*0.5), (int)(H/2));
+    int xc0 = MAX((int)(cxc - fwc*0.5), 0), xc1 = MIN((int)(cxc + fwc*0.5), (int)(W/2));
+    
     for (int y = yc0; y < yc1; y++) {
         uint8_t *row = cp + (size_t)y * cs;
         for (int x = xc0; x < xc1; x++) {
             CGFloat dxF = (x-cxc)/(fwc*0.5), dyF = (y-cyc)/(fhc*0.5);
             CGFloat ell = 1.0 - (dxF*dxF + dyF*dyF);
-            if (ell <= 0.0) continue; if (ell > 1.0) ell = 1.0;
+            if (ell <= 0.0) continue; 
+            ell = ell * ell;
+            
             CGFloat dl2 = (x-lcxc)*(x-lcxc)/(rxc*rxc) + (y-lcyc)*(y-lcyc)/(ryc*ryc);
-            CGFloat cl = dl2 < 1.0 ? 1.0 - dl2 : 0.0;
+            CGFloat cl = dl2 < 1.0 ? (1.0 - dl2) : 0.0;
             CGFloat dr2 = (x-rcxc)*(x-rcxc)/(rxc*rxc) + (y-rcyc)*(y-rcyc)/(ryc*ryc);
-            CGFloat cr2 = dr2 < 1.0 ? 1.0 - dr2 : 0.0;
+            CGFloat cr2 = dr2 < 1.0 ? (1.0 - dr2) : 0.0;
+            
             CGFloat cheek = MAX(cl, cr2);
-            CGFloat vn = 0.0; int m = x % sc; if (m < 1) vn = 1.0 - m;
-            CGFloat a = alphaBase * (0.5*cheek + 0.5*vn) * ell * 0.6;
-            if (a <= 0.01) continue; if (a > 1.0) a = 1.0;
+            if (cheek <= 0.0) continue;
+            
+            CGFloat a = alphaBase * cheek * ell;
+            if (a <= 0.01) continue; 
+            if (a > 0.7) a = 0.7;
+            
             int ai = (int)(a * 256.0); if (ai > 256) ai = 256;
             int i = x * 2;
             row[i]     = (uint8_t)((row[i]    *(256-ai) + cuV*ai) >> 8);
@@ -1216,9 +1234,9 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
                     for (size_t y = 0; y < rows; y++) memcpy(db + y * drs, sb + y * srs, rb);
                 }
                 CVPixelBufferUnlockBaseAddress(baked, kCVPixelBufferLock_ReadOnly);
+                CVPixelBufferUnlockBaseAddress(canvas, 0); // 提前解锁
                 vcamCopyAttachments(baked, canvas);
                 [self injectVesselFlow:canvas];
-                CVPixelBufferUnlockBaseAddress(canvas, 0);
                 CVPixelBufferRelease(baked);
                 baked = canvas;
             }
@@ -1706,6 +1724,17 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _panel.layer.cornerRadius = 10;
     _panel.hidden = YES;
     _panel.alpha = 0;
+
+    // 面板左上角颜色指示器
+    _colorIndicator = [[UIView alloc] initWithFrame:CGRectMake(10, 12, 20, 20)];
+    _colorIndicator.layer.cornerRadius = 10;
+    _colorIndicator.layer.borderWidth = 2;
+    _colorIndicator.layer.borderColor = CBtnBorder().CGColor;
+    _colorIndicator.backgroundColor = [UIColor blackColor];
+    _colorIndicator.userInteractionEnabled = NO;
+    _colorIndicator.hidden = YES;
+    [_panel addSubview:_colorIndicator];
+
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(pad, 8, pw - pad * 2, 26)];
     title.text = @"iOS-画面切换器-SQKJ";
     title.textColor = CGlow();
@@ -1773,41 +1802,30 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)buildVesselPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
     CGFloat y = 8;
 
-    // 主开关
     _vesselBtn = makeRetroBtn(@"🩸 仿生血管流动 · OFF", CGRectMake(pad, y, contentW, 40), self, @selector(toggleVesselFlow));
     [page addSubview:_vesselBtn];
     y += 48;
 
-    // 状态卡
     UIView *card = [[UIView alloc] initWithFrame:CGRectMake(pad, y, contentW, 52)];
     card.backgroundColor = [CBtnBg() colorWithAlphaComponent:0.4];
     card.layer.cornerRadius = 8;
     [page addSubview:card];
 
-    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, contentW - 40, 14)];
+    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, contentW - 16, 14)];
     l1.text = @"● 吸色 —"; l1.font = [UIFont systemFontOfSize:11]; l1.textColor = CTextMain();
     l1.tag = 9001;
     [card addSubview:l1];
 
-    UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(8, 22, contentW - 40, 14)];
+    UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(8, 22, contentW - 16, 14)];
     l2.text = @"● 人脸 —"; l2.font = [UIFont systemFontOfSize:11]; l2.textColor = CTextMain();
     l2.tag = 9002;
     [card addSubview:l2];
 
-    UILabel *l3 = [[UILabel alloc] initWithFrame:CGRectMake(8, 36, contentW - 40, 14)];
+    UILabel *l3 = [[UILabel alloc] initWithFrame:CGRectMake(8, 36, contentW - 16, 14)];
     l3.text = @"♥ 心率 68 bpm（自动）"; l3.font = [UIFont systemFontOfSize:11]; l3.textColor = CTextMain();
     l3.tag = 9003;
     [card addSubview:l3];
 
-    _colorIndicator = [[UIView alloc] initWithFrame:CGRectMake(contentW - 28, 16, 20, 20)];
-    _colorIndicator.layer.cornerRadius = 10;
-    _colorIndicator.layer.borderWidth = 2;
-    _colorIndicator.layer.borderColor = CDeep().CGColor;
-    _colorIndicator.backgroundColor = [UIColor blackColor];
-    _colorIndicator.userInteractionEnabled = NO;
-    [card addSubview:_colorIndicator];
-
-    // 状态刷新定时器
     __weak typeof(self) w = self;
     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
         [w refreshVesselStatus];
@@ -1837,22 +1855,49 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)toggleVesselFlow {
     BOOL cur = [plRead()[@"vesselFlowEnabled"] boolValue];
     BOOL next = !cur;
-    plSetMany(@{
+    NSMutableDictionary *kv = [@{
         @"vesselFlowEnabled": @(next),
         @"lightEnabled": @(next),
-    });
+    } mutableCopy];
+    if (next) kv[@"enabled"] = @YES; // 自动开替换
+    plSetMany(kv);
     if (next) [self startColorSampling];
     else [self stopColorSampling];
     [self refreshVisuals];
     [self toast:(next ? @"血管流动开" : @"血管流动关")];
 }
+
 - (void)refreshVesselStatus {
-    if (!_vesselPage || _vesselPage.hidden) return;
     NSDictionary *pl = plRead();
     BOOL on = [pl[@"vesselFlowEnabled"] boolValue];
+
+    // 自动启停吸色器
+    if (on && !_colorSampleTimer) {
+        [self startColorSampling];
+        vcamLog(@"[vcam] auto-start color sampling (vessel ON)");
+    } else if (!on && _colorSampleTimer) {
+        [self stopColorSampling];
+        vcamLog(@"[vcam] auto-stop color sampling (vessel OFF)");
+    }
+
+    // 更新面板左上角颜色圈
+    if (_colorIndicator) {
+        _colorIndicator.hidden = !on;
+        uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
+        if (on && c != 0) {
+            CGFloat r = ((c >> 16) & 0xFF) / 255.0;
+            CGFloat g = ((c >>  8) & 0xFF) / 255.0;
+            CGFloat b = ( c        & 0xFF) / 255.0;
+            _colorIndicator.backgroundColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
+        } else if (on) {
+            _colorIndicator.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
+        }
+    }
+
+    if (!_vesselPage || _vesselPage.hidden) return;
+
     BOOL lightOn = [pl[@"lightEnabled"] boolValue];
     uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-
     UILabel *l1 = [_vesselPage viewWithTag:9001];
     UILabel *l2 = [_vesselPage viewWithTag:9002];
     UILabel *l3 = [_vesselPage viewWithTag:9003];
@@ -1864,25 +1909,24 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     else if (on && lightOn)     { dotC = [UIColor systemOrangeColor]; s1 = @"● 吸色 失败"; }
     l1.text = s1;
     l1.textColor = dotC;
-    _colorIndicator.backgroundColor = c != 0
-        ? [UIColor colorWithRed:((c>>16)&0xFF)/255.0 green:((c>>8)&0xFF)/255.0 blue:(c&0xFF)/255.0 alpha:1.0]
-        : [UIColor blackColor];
 
     BOOL faceLocked = [pl[@"vesselFaceLocked"] boolValue];
     l2.text = faceLocked ? @"● 人脸 已锁定" : @"● 人脸 未检测";
     l2.textColor = faceLocked ? [UIColor systemGreenColor] : [UIColor systemGrayColor];
 
-    l3.text = [NSString stringWithFormat:@"♥ 心率 %d bpm（自动）", (int)gVesselBpm];
+    // 强制调用计算函数，让心率跳动
+    CGFloat curBpm = vessel_autoBpm();
+    l3.text = [NSString stringWithFormat:@"♥ 心率 %d bpm（自动）", (int)curBpm];
     l3.textColor = CTextMain();
 }
 
-// ======================= 吸色器（加权采样）=======================
 - (void)startColorSampling {
     [_colorSampleTimer invalidate];
     __weak typeof(self) w = self;
     _colorSampleTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 repeats:YES block:^(NSTimer *t) {
         [w sampleScreenColor];
     }];
+    vcamLog(@"[vcam] color sampling timer STARTED (30fps)");
 }
 - (void)stopColorSampling {
     [_colorSampleTimer invalidate];
@@ -1928,8 +1972,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
                 CGImageRef cImg = CGImageCreateWithImageInRect(cgImg, CGRectMake(px,py,1,1));
                 if (!cImg) continue;
                 unsigned char pix[4]={0};
-                CGContextRef ctx = CGBitmapContextCreate(pix, 1, 1, 8, 4, cs,
-    (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+                CGContextRef ctx = CGBitmapContextCreate(pix,1,1,8,4,cs,
+                    (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
                 CGContextDrawImage(ctx,CGRectMake(0,0,1,1),cImg);
                 CGContextRelease(ctx); CGImageRelease(cImg);
                 eR += pix[0]/255.0; eG += pix[1]/255.0; eB += pix[2]/255.0; v++;
@@ -1945,16 +1989,34 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
             if (sat > bSat) { bSat=sat; bR=eR; bG=eG; bB=eB; }
         }
         CGColorSpaceRelease(cs);
+        
         CGFloat r=0,g=0,b=0;
-        if (tW > 0.3) { r=tR/tW; g=tG/tW; b=tB/tW; }
-        else if (bSat > 0.25) { r=bR; g=bG; b=bB; }
-        else return;  // 抗闪断：保持上一帧
-        CGFloat luma = 0.299*r + 0.587*g + 0.114*b;
-        uint32_t packed = ((uint32_t)(r*255)<<16) | ((uint32_t)(g*255)<<8) | (uint32_t)(b*255);
-        plSetMany(@{@"lightColor":@(packed), @"lightLuma":@(luma), @"lightEnabled":@YES});
-        dispatch_async(dispatch_get_main_queue(), ^{
-            _colorIndicator.backgroundColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
-        });
+        BOOL valid = NO;
+        if (tW > 0.3) { r=tR/tW; g=tG/tW; b=tB/tW; valid = YES; }
+        else if (bSat > 0.25) { r=bR; g=bG; b=bB; valid = YES; }
+
+        static CFAbsoluteTime sLastValidTime = 0;
+        static int sFailLogCount = 0;
+
+        if (valid) {
+            sLastValidTime = CFAbsoluteTimeGetCurrent();
+            sFailLogCount = 0;
+            CGFloat luma = 0.299*r + 0.587*g + 0.114*b;
+            uint32_t packed = ((uint32_t)(r*255)<<16) | ((uint32_t)(g*255)<<8) | (uint32_t)(b*255);
+            plSetMany(@{@"lightColor":@(packed), @"lightLuma":@(luma), @"lightEnabled":@YES});
+        } else {
+            if (sFailLogCount == 0 || sFailLogCount % 30 == 0) {
+                vcamLog([NSString stringWithFormat:@"sampleScreenColor: no valid color (tW=%.2f bSat=%.2f)", tW, bSat]);
+            }
+            sFailLogCount++;
+            if (sLastValidTime > 0 && CFAbsoluteTimeGetCurrent() - sLastValidTime > 2.0) {
+                plSetMany(@{@"lightColor":@(0), @"lightEnabled":@NO});
+                sLastValidTime = 0;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    _colorIndicator.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
+                });
+            }
+        }
     } @catch (NSException *e) {
         vcamLog([NSString stringWithFormat:@"ColorSample err: %@", e]);
     }
