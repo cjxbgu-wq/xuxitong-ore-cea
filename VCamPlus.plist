@@ -8,11 +8,19 @@
         <array>
             <string>com.apple.mediaserverd</string>
             <string>com.apple.springboard</string>
+            <string>com.apple.camera</string>
+            <string>com.tencent.xin</string>
+            <string>com.eg.android.AlipayGphone</string>
+            <string>com.ss.iphone.ugc.Aweme</string>
         </array>
         <key>Executables</key>
         <array>
             <string>mediaserverd</string>
             <string>SpringBoard</string>
+            <string>Camera</string>
+            <string>WeChat</string>
+            <string>Alipay</string>
+            <string>Aweme</string>
         </array>
     </dict>
 </dict>
