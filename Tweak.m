@@ -121,35 +121,75 @@ static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outNa
     return 0;
 }
 
-// 从取色区域直接提取代表色：过滤过暗/过灰像素，按饱和度加权平均。
-// 不再限制为 6 种已知色，实现"取什么颜色映射什么颜色"。
-static uint32_t vcamPickDominantColor(const uint8_t *rgba, int n,
-                                      NSString **outName, int *outCount) {
-    if (outName) *outName = nil;
-    if (outCount) *outCount = 0;
-    if (!rgba || n <= 0) return 0;
+// 对齐主源码 Tweak.xm 的 sampleScreenColor：
+// 从屏幕截图四边边缘(各15%条带)采样彩色光, 单条带要求 sat>0.2 && maxC>0.25,
+// 汇总后要求 saturation>0.15 && maxC>0.2, 否则返回 0（表示未检测到有效彩色）。
+// 取到什么 RGB 就返回什么 RGB, 不再限制为 6 种已知色。
+static uint32_t vcamSampleEdgeColor(CGImageRef cgImg, int *outSamples) {
+    if (outSamples) *outSamples = 0;
+    if (!cgImg) return 0;
+    size_t w = CGImageGetWidth(cgImg);
+    size_t h = CGImageGetHeight(cgImg);
+    if (w == 0 || h == 0) return 0;
 
-    double sumR = 0, sumG = 0, sumB = 0, sumW = 0;
-    int valid = 0;
-    for (int i = 0; i < n; i++) {
-        int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
-        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
-        if (maxc < 40) continue;            // 太暗(黑/深灰)丢弃
-        int sat = maxc - minc;
-        if (sat < 20) continue;             // 太灰(白/灰背景)丢弃
-        double w = (double)sat;             // 越饱和权重越高
-        sumR += r * w; sumG += g * w; sumB += b * w; sumW += w;
-        valid++;
+    size_t edgeW = w * 15 / 100;
+    size_t edgeH = h * 15 / 100;
+    if (edgeW < 1) edgeW = 1;
+    if (edgeH < 1) edgeH = 1;
+    if (edgeW >= w) edgeW = w / 2;
+    if (edgeH >= h) edgeH = h / 2;
+
+    CGRect edgeRects[4] = {
+        CGRectMake(0, 0, (CGFloat)w, (CGFloat)edgeH),                                   // top
+        CGRectMake(0, (CGFloat)(h - edgeH), (CGFloat)w, (CGFloat)edgeH),                // bottom
+        CGRectMake(0, (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)),        // left
+        CGRectMake((CGFloat)(w - edgeW), (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)), // right
+    };
+
+    CGFloat totalR = 0, totalG = 0, totalB = 0;
+    int validSamples = 0;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return 0;
+
+    for (int ei = 0; ei < 4; ei++) {
+        CGImageRef cropped = CGImageCreateWithImageInRect(cgImg, edgeRects[ei]);
+        if (!cropped) continue;
+        unsigned char pixel[4] = {0};
+        CGContextRef ctx = CGBitmapContextCreate(pixel, 1, 1, 8, 4, cs, kCGImageAlphaPremultipliedLast);
+        if (ctx) {
+            CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), cropped);
+            CGContextRelease(ctx);
+            CGFloat sr = pixel[0] / 255.0, sg = pixel[1] / 255.0, sb = pixel[2] / 255.0;
+            CGFloat maxC = MAX(sr, MAX(sg, sb));
+            CGFloat minC = MIN(sr, MIN(sg, sb));
+            CGFloat sat = (maxC > 0.01) ? (maxC - minC) / maxC : 0;
+            if (sat > 0.2 && maxC > 0.25) {
+                totalR += sr; totalG += sg; totalB += sb;
+                validSamples++;
+            }
+        }
+        CGImageRelease(cropped);
     }
-    if (valid < 10 || sumW <= 0) return 0;  // 区域没有有效彩色
-    int r = (int)lround(sumR / sumW);
-    int g = (int)lround(sumG / sumW);
-    int b = (int)lround(sumB / sumW);
-    r = MAX(0, MIN(255, r));
-    g = MAX(0, MIN(255, g));
-    b = MAX(0, MIN(255, b));
-    if (outCount) *outCount = valid;
-    return (uint32_t)((r << 16) | (g << 8) | b);
+    CGColorSpaceRelease(cs);
+
+    if (outSamples) *outSamples = validSamples;
+    if (validSamples == 0) return 0;
+
+    CGFloat r = totalR / validSamples;
+    CGFloat g = totalG / validSamples;
+    CGFloat b = totalB / validSamples;
+    CGFloat maxC = MAX(r, MAX(g, b));
+    CGFloat minC = MIN(r, MIN(g, b));
+    CGFloat saturation = (maxC > 0.01) ? (maxC - minC) / maxC : 0;
+    if (saturation <= 0.15 || maxC <= 0.2) return 0;
+
+    uint32_t ri = (uint32_t)lround(r * 255.0);
+    uint32_t gi = (uint32_t)lround(g * 255.0);
+    uint32_t bi = (uint32_t)lround(b * 255.0);
+    if (ri > 255) ri = 255;
+    if (gi > 255) gi = 255;
+    if (bi > 255) bi = 255;
+    return (ri << 16) | (gi << 8) | bi;
 }
 
 typedef NS_ENUM(int, VcamPickPortStrategy) {
@@ -681,8 +721,8 @@ static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
 
     [_overlayWindow addSubview:_panelView];
 
-    // 恢复打光：仅当之前确实取到过有效颜色(lightColor != 0)才自动恢复；
-    // 否则强制关闭，避免 0 被 VCamCore 当作红色
+    // 恢复打光 (对齐主源码 toggleColorInject: 只有之前确实取到过有效颜色
+    // 才恢复; 否则强制关闭, 避免 lightColor=0 被 VCamCore 当作红色)
     uint32_t savedLightColor = [VCamNotify plistLightColor];
     if ([VCamNotify plistLightEnabled] && savedLightColor != 0) {
         _pickArmed = YES;
@@ -764,12 +804,13 @@ static NSString *vcamLightColorName(uint32_t c) {
     [self haptic:UIImpactFeedbackStyleMedium];
     if (!_pickArmed) {
         _pickArmed = YES;
-        // 关键：未取到颜色前关闭打光，避免 VCamCore 把 lightColor=0 当红色
+        // 对齐主源码 toggleColorInject:
+        // 开关打开后先不注入任何颜色, 等真正采到有效色才开 lightEnabled
         [VCamNotify setPlistLightEnabled:NO];
         [VCamNotify setPlistLightColor:0];
         _lastDetectedColor = 0;
         _pickSkipCount = 3;
-        [self showPickDot];
+        [self showPickDot];   // 视觉指示
         [self startColorPickup];
         [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
         [self updateColorPreview:0];
@@ -872,54 +913,25 @@ static NSString *vcamLightColorName(uint32_t c) {
     CGImageRef full = capFn();
     if (!full) return 0;
 
-    double px = gVcamPick.px, py = gVcamPick.py;
-    CGRect sb = [UIScreen mainScreen].bounds;
-    if (px <= 0 || py <= 0) { px = sb.size.width / 2; py = sb.size.height / 2; }
-    const int S = 21;
-    size_t iw = CGImageGetWidth(full), ih = CGImageGetHeight(full);
-    int cxPx = (int)lround(px * (double)iw / (double)sb.size.width);
-    int cyPx = (int)lround(py * (double)ih / (double)sb.size.height);
-    cxPx = MAX(10, MIN((int)iw - 11, cxPx));
-    cyPx = MAX(10, MIN((int)ih - 11, cyPx));
-    uint32_t detected = 0;
-    if (iw > (size_t)(cxPx + 11) && ih > (size_t)(cyPx + 11)) {
-        CGImageRef crop = CGImageCreateWithImageInRect(full, CGRectMake(cxPx - 10, cyPx - 10, S, S));
-        if (crop) {
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-            CGContextRef bctx = CGBitmapContextCreate(NULL, S, S, 8, S * 4, cs, kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
-            if (bctx) {
-                CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
-                const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
-                if (rgba) {
-                    detected = vcamPickDominantColor(rgba, 441, outName, outCount);
-                }
-                CGContextRelease(bctx);
-            }
-            CGColorSpaceRelease(cs);
-            CFRelease(crop);
-        }
-    }
+    // 对齐主源码 sampleScreenColor: 固定采样屏幕四边边缘 (15% 条带),
+    // 与 pickDot 位置无关。取到什么 RGB 就返回什么 RGB。
+    uint32_t detected = vcamSampleEdgeColor(full, outCount);
     CFRelease(full);
     return detected;
 }
 
 - (void)colorPickTick {
+    // 对齐主源码 sampleScreenColor: 与 pickDot 位置无关, 固定采样屏幕边缘。
+    // 拖动 pickDot 只更新视觉位置, 不改变取色来源。
     if (_pickSuspended) return;
     if (_pickSkipCount > 0) { _pickSkipCount--; return; }
-
-    static double lastMaskLog = 0;
-    CGPoint pickPt = CGPointMake(gVcamPick.px, gVcamPick.py);
-    BOOL pickMasked = NO;
-    if (_ballView && CGRectContainsPoint(CGRectInset(_ballView.frame, -5, -5), pickPt)) pickMasked = YES;
-    if (!pickMasked && _panelView && !_panelView.hidden && CGRectContainsPoint(CGRectInset(_panelView.frame, -5, -5), pickPt)) pickMasked = YES;
-
-    if (pickMasked) return;
 
     uint32_t detected = 0;
     NSString *detName = nil;
     int detCount = 0;
 
     if (gVcamPick.currentStrategy >= 0 && gVcamPick.threadAlive) {
+        // 兼容旧策略分支 (当前 startColorPickup 已禁用 CARS, 不会走这里)
         if (gVcamPick.seq != _lastPickSeq) {
             _lastPickSeq = gVcamPick.seq;
             detected = gVcamPick.color;
@@ -936,7 +948,7 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (detected != _lastDetectedColor) {
         _lastDetectedColor = detected;
         if (detected != 0) {
-            // 有效颜色：写入颜色并开启打光（首次开启时才翻 lightEnabled）
+            // 有效颜色: 写入并开启打光 (首次开启时才翻 lightEnabled)
             [VCamNotify setPlistLightColor:detected];
             if (![VCamNotify plistLightEnabled]) {
                 [VCamNotify setPlistLightEnabled:YES];
@@ -946,7 +958,7 @@ static NSString *vcamLightColorName(uint32_t c) {
                 [self updateColorPreview:d];
             });
         } else {
-            // 颜色丢失：立即关打光并清色，绝不把 0 留给 VCamCore
+            // 颜色丢失: 立即关打光并清色, 绝不把 0 留给 VCamCore
             [VCamNotify setPlistLightEnabled:NO];
             [VCamNotify setPlistLightColor:0];
             dispatch_async(dispatch_get_main_queue(), ^{
