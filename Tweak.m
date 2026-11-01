@@ -1063,24 +1063,6 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
 }
 @end
 
-static UIButton *makeRetroBtn(NSString *title, CGRect frame, id t, SEL s) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom]; b.frame = frame; [b setTitle:title forState:UIControlStateNormal]; [b setTitleColor:CTextMain() forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:12]; b.backgroundColor = CBtnBg(); b.layer.cornerRadius = 10; b.layer.borderWidth = 1; b.layer.borderColor = CBtnBorder().CGColor;
-    if (t && s) [b addTarget:t action:s forControlEvents:UIControlEventTouchUpInside]; return b;
-}
-static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
-    UIButton *b = makeRetroBtn(@"", frame, t, s); UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightBold];
-    UIImage *img = [UIImage systemImageNamed:sys withConfiguration:cfg]; if (img) { [b setImage:img forState:UIControlStateNormal]; b.tintColor = CTextMain(); } return b;
-}
-
-@interface VCBall : NSObject <PHPickerViewControllerDelegate>
-@property (nonatomic, strong) UIWindow *win; @property (nonatomic, strong) VCBallView *ball; @property (nonatomic, strong) UIView *panel, *ctrlPage;
-@property (nonatomic, strong) UIButton *replaceBtn, *playBtn, *mirrorBtn, *vesselBtn, *pickBtn; @property (nonatomic, strong) UISlider *colorSlider; @property (nonatomic, strong) UILabel *colorValueLabel;
-@property (nonatomic, strong) UIView *colorIndicator, *pickerCrosshair; @property (nonatomic, strong) NSTimer *colorSampleTimer; @property (nonatomic, assign) BOOL visible, floating, paused;
-@property (nonatomic, assign) int buildRetries; @property (nonatomic, assign) int pickerState;
-+ (instancetype)shared; - (void)show; - (void)hide; - (void)build; - (void)_build; - (void)buildPanel; - (void)buildCtrlPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH; - (void)refreshVisuals; - (void)layoutPanel; - (void)toast:(NSString *)msg; - (void)pickMedia; - (void)toggleReplace; - (void)rotate; - (void)togglePause; - (void)panUp; - (void)panDown; - (void)panLeft; - (void)panRight; - (void)panByX:(double)dx Y:(double)dy; - (void)zoomIn; - (void)zoomOut; - (void)zoomBy:(double)f; - (void)resetTransform; - (void)toggleMirror; - (void)toggleVesselFlow; - (void)colorIntensityChanged:(UISlider *)s; - (void)startColorSampling; - (void)stopColorSampling; - (void)sampleScreenColor; - (void)ballTap; - (void)ballDrag:(UIPanGestureRecognizer *)g; - (void)didActive; - (void)loadVideoProvider:(NSItemProvider *)p; - (void)loadImageProvider:(NSItemProvider *)p; - (BOOL)isVideoProvider:(NSItemProvider *)p; - (BOOL)isImageProvider:(NSItemProvider *)p; - (UIButton *)makeRainbowBtn:(CGRect)frame; - (UIView *)makeReserveSlot:(CGRect)frame; - (void)pickBtnTapped; - (void)pickBtnLongPressed:(UILongPressGestureRecognizer *)g; - (void)handlePickerPan:(UIPanGestureRecognizer *)g; - (void)pickColorAtPoint:(CGPoint)pt;
-@end
-
 @implementation VCBall
 + (instancetype)shared { static VCBall *i; static dispatch_once_t t; dispatch_once(&t, ^{ i = [[VCBall alloc] init]; }); return i; }
 - (void)show { if (_floating) return; _floating = YES; dispatch_async(dispatch_get_main_queue(), ^{ [self build]; }); [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didActive) name:UIApplicationDidBecomeActiveNotification object:nil]; }
@@ -1174,7 +1156,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 }
 - (void)startColorSampling {
     [_colorSampleTimer invalidate]; __weak typeof(self) w = self;
-    _colorSampleTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/10.0 repeats:YES block:^(NSTimer *t) { [w sampleScreenColor]; }]; // 修复：10fps
+    _colorSampleTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/10.0 repeats:YES block:^(NSTimer *t) { [w sampleScreenColor]; }];
 }
 - (void)stopColorSampling { [_colorSampleTimer invalidate]; _colorSampleTimer = nil; }
 
@@ -1183,10 +1165,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         UIImage *snapshot = nil; UIScreen *screen = [UIScreen mainScreen];
         SEL s1 = NSSelectorFromString(@"_snapshotIncludingStatusBar:");
         if ([screen respondsToSelector:s1]) {
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-             snapshot = [screen performSelector:s1 withObject:@(NO)];
-            #pragma clang diagnostic pop       }
+            snapshot = ((id (*)(id, SEL, BOOL))objc_msgSend)(screen, s1, NO);
+        }
         if (!snapshot) return;
         CGImageRef cgImg = snapshot.CGImage; if (!cgImg) return;
         size_t w = CGImageGetWidth(cgImg), h = CGImageGetHeight(cgImg);
@@ -1264,10 +1244,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     @try {
         UIImage *snapshot = nil; UIScreen *screen = [UIScreen mainScreen]; SEL s1 = NSSelectorFromString(@"_snapshotIncludingStatusBar:");
         if ([screen respondsToSelector:s1]) {
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-               snapshot = [screen performSelector:s1 withObject:@(NO)];
-            #pragma clang diagnostic pop     }
+            snapshot = ((id (*)(id, SEL, BOOL))objc_msgSend)(screen, s1, NO);
+        }
         if (!snapshot) return; CGImageRef cgImg = snapshot.CGImage; if (!cgImg) return;
         size_t w = CGImageGetWidth(cgImg), h = CGImageGetHeight(cgImg);
         CGFloat scaleX = (CGFloat)w / _win.bounds.size.width, scaleY = (CGFloat)h / _win.bounds.size.height;
@@ -1304,20 +1282,3 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     l.alpha = 0; [_win addSubview:l]; [UIView animateWithDuration:0.2 animations:^{ l.alpha = 1; } completion:^(BOOL f){ [UIView animateWithDuration:0.3 delay:1.2 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL f2){ [l removeFromSuperview]; }]; }];
 }
 @end
-
-// ======================= 入口 =======================
-__attribute__((constructor))
-static void vcamInit(void) {
-    @autoreleasepool {
-        if (vcamLoadedViaOtherPath()) return;
-        NSString *name = [[NSProcessInfo processInfo] processName];
-        vcamLoadBeacon(name);
-        if ([name isEqualToString:@"mediaserverd"]) {
-            [[VCCore shared] startRender]; installHooks(); [[VCCore shared] startPolling];
-        } else if ([name isEqualToString:@"SpringBoard"]) {
-            [[VCCore shared] startPolling]; [[VCBall shared] show];
-        }
-    }
-}
-__attribute__((destructor))
-static void vcamDeinit(void) {}
