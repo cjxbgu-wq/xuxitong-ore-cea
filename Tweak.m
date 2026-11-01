@@ -25,7 +25,7 @@
 // ======================= 日志与 plist =======================
 static NSString *const kPlist = @"/var/mobile/Media/DCIM/vc.plist";
 
-static BOOL vcamLogOn(void) {
+__attribute__((unused)) static BOOL vcamLogOn(void) {
     static int c = -1;
     if (c < 0) {
         @try {
@@ -36,7 +36,7 @@ static BOOL vcamLogOn(void) {
     }
     return c == 1;
 }
-static void vcamLog(NSString *m) {
+__attribute__((unused)) static void vcamLog(NSString *m) {
     if (!vcamLogOn()) return;
     @try {
         NSString *p = @"/tmp/vcam_log.txt";
