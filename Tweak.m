@@ -6,7 +6,6 @@
 //  只在 SpringBoard 中使用（需要 UIKit）
 //
 
-#import "VCamFloatingBall.h"
 #import "VCamCore.h"
 #import "VCamNotify.h"
 #import "ball_icon.h"
@@ -14,6 +13,16 @@
 #import "VCamStr.h"
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
+
+// ===== 方案 B: 原 VCamFloatingBall.h 的内联声明 =====
+// 只导出外部真正会调用的接口; 内部视图类(VCamOverlayWindow/VCamBallView/
+// VCamPanelButton/VCamPickDotView) 都定义在本文件, 不需要放头文件。
+@interface VCamFloatingBall : NSObject
++ (instancetype)sharedInstance;
+- (void)showFloatingBall;
+- (void)hideFloatingBall;
+@end
+// =====================================================
 
 // 按钮图标解码(与悬浮球品牌图标同机制): btn_icons.h 内 XOR 8字节 rolling key
 // 加密 PNG 字节, 此处运行时解密后 imageWithData —— 二进制内无 PNG 魔数, 防提取
