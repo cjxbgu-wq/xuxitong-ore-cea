@@ -24,10 +24,10 @@
     <true/>
     <key>lightColor</key>
     <integer>0</integer>
-    <key>lightLuma</key>
-    <real>0.5</real>
-    <key>vesselFaceLocked</key>
-    <false/>
+    <key>injectMode</key>
+    <integer>0</integer>
+    <key>vesselInjectAlpha</key>
+    <real>0.35</real>
     <key>logEnabled</key>
     <true/>
 </dict>
