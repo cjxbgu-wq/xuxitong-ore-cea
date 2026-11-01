@@ -20,6 +20,12 @@
 //    - mediaserverd 中不能重启，避免重复 stopDecoding+cleanup+reload
 //    - Darwin 通知在 mediaserverd 中不安全，用 plist 轮询
 //
+//  自包含编译（本文件不依赖任何项目内头文件）：
+//    VCamCore / VCamFloatingBall / VCamNotify 的实现由同工程其他 .m 提供。
+//    本文件通过 NSClassFromString + objc_msgSend 动态调用 —— 编译期不 #import
+//    项目内头文件（修复 CI 'VCamCore.h' file not found）；运行时若类未加载，
+//    弱调用是 no-op 不崩溃；若类在包里则功能完整。
+//
 
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -35,22 +41,53 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 
-#import "VCamCore.h"
-#import "VCamNotify.h"
+// ===== 弱调用桥（自包含编译核心） =====
+// 编译期不依赖项目内头文件；运行时类不存在则 no-op
+static id vcam_class_singleton(const char *className) {
+    Class cls = NSClassFromString([NSString stringWithUTF8String:className]);
+    if (!cls) return nil;
+    SEL sel = sel_registerName("sharedInstance");
+    if (![cls respondsToSelector:sel]) return nil;
+    return ((id(*)(id, SEL))objc_msgSend)((id)cls, sel);
+}
 
-// ===== VCamFloatingBall 内联接口声明 =====
-// 原 #import "VCamFloatingBall.h" 因头文件不在编译路径导致 build 失败，
-// 改为内联声明；实现由 VCamFloatingBall.m 提供（Makefile 已包含该源文件）
-@interface VCamFloatingBall : NSObject
-+ (instancetype)sharedInstance;
-- (void)showFloatingBall;
-- (void)hideFloatingBall;
-@end
+static void vcam_core_render(CVPixelBufferRef pb, double pts) {
+    id core = vcam_class_singleton("VCamCore");
+    if (!core) return;
+    SEL sel = sel_registerName("renderReplacementToPixelBuffer:pts:");
+    if (![core respondsToSelector:sel]) return;
+    ((void(*)(id, SEL, CVPixelBufferRef, double))objc_msgSend)(core, sel, pb, pts);
+}
+
+static void vcam_core_init_msd(void) {
+    id core = vcam_class_singleton("VCamCore");
+    if (!core) return;
+    SEL sel = sel_registerName("initializeInMediaserverd");
+    if ([core respondsToSelector:sel]) ((void(*)(id, SEL))objc_msgSend)(core, sel);
+}
+
+static void vcam_core_init_sb(void) {
+    id core = vcam_class_singleton("VCamCore");
+    if (!core) return;
+    SEL sel = sel_registerName("initializeInSpringBoard");
+    if ([core respondsToSelector:sel]) ((void(*)(id, SEL))objc_msgSend)(core, sel);
+}
+
+static void vcam_core_stop_polling(void) {
+    id core = vcam_class_singleton("VCamCore");
+    if (!core) return;
+    SEL sel = sel_registerName("stopStatePolling");
+    if ([core respondsToSelector:sel]) ((void(*)(id, SEL))objc_msgSend)(core, sel);
+}
+
+static void vcam_ball_show(void) {
+    id ball = vcam_class_singleton("VCamFloatingBall");
+    if (!ball) return;
+    SEL sel = sel_registerName("showFloatingBall");
+    if ([ball respondsToSelector:sel]) ((void(*)(id, SEL))objc_msgSend)(ball, sel);
+}
 
 // MSHookMessageEx 自包含实现（不依赖 CydiaSubstrate/ElleKit）
-// 原因：Dopamine 无 ElleKit/Substrate/libinjector，systemhook 未注入 mediaserverd
-// (proxy 跳过)，opainject 单独注入 VCamPlus 时 _MSHookMessageEx 符号缺失导致
-// dlopen 失败。MSHookMessageEx 本质是 method_setImplementation 的封装。
 static void MSHookMessageEx(Class cls, SEL sel, IMP newImp, IMP *origPtr) {
     Method method = class_getInstanceMethod(cls, sel);
     if (!method) {
@@ -61,11 +98,7 @@ static void MSHookMessageEx(Class cls, SEL sel, IMP newImp, IMP *origPtr) {
     method_setImplementation(method, newImp);
 }
 
-// 文件日志（mediaserverd 中 NSLog 不可见）
-// 日志总开关(2026-08-16, diskwrites 崩溃循环止血): 默认静默, vc.plist "logEnabled=YES" 打开
-// 修复(2026-08-18 日志全静默 bug): 旧版首次读失败(dylib 加载早期 pathhook 未装好,
-// mediaserverd 沙盒读不到 plist → nil)就永久缓存 0 → 整个进程生命周期日志关闭,
-// 黑屏被杀时无法取证。改为: 读不到文件不缓存下次重试 + 双路径兼容。
+// 文件日志
 static BOOL vcam_log_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -78,7 +111,6 @@ static BOOL vcam_log_enabled(void) {
     return cached == 1;
 }
 
-// 日志全局限速令牌桶(定义在 VCamCore.m, 全进程共享磁盘写入预算 —— 磁盘配额击杀根治)
 extern BOOL vcam_log_budget_take(void);
 
 static volatile int32_t vcamTweakLogCount = 0;
@@ -86,7 +118,7 @@ static void vcam_tweak_log(NSString *msg) {
     if (!vcam_log_enabled()) return;
     if (!vcam_log_budget_take()) return;
     int32_t n = __sync_add_and_fetch(&vcamTweakLogCount, 1);
-    if (n > 2000) return;  // 限制日志量(still 诊断需要更大预算)
+    if (n > 2000) return;
     @try {
         NSString *logPath = @"/tmp/vcam_tweak_log.txt";
         NSString *ts = [NSDate date].description;
@@ -103,21 +135,11 @@ static void vcam_tweak_log(NSString *msg) {
 }
 
 #pragma mark - 照片过曝: 到达诊断 + 曝光元数据剥离(metaFix)
-// 背景(2026-08-15 千面对比实测): 拍照(静止照片/实况封面)过曝 = 照片合成管线基于
-// 真实镜头进光元数据(LuxLevel/ExposureTime 等)做曝光增益, 千面同样过曝。
-// 本实验超越千面: 在 still 管线入口剥离曝光元数据, 下游合成拿不到"暗光"信息
-// 理论上不再拉增益。A/B 开关: vc.plist "metaFix"(默认 YES), 3 秒内生效无需重启。
+
 static int vcamScalerArrCount = 0;
 static int vcamEncoderArrCount = 0;
 static int vcamPhotoEmitCount = 0;
 
-// metaFix 默认 NO(2026-08-19 UAF 崩溃修复): CMRemoveAttachment 在 CMCapture 管线并发
-// 使用的 attachments 字典上删 key —— emit/scaler/encoder 三个 hook 在不同 Apple 队列
-// 线程并发操作同一物理 buffer 的 attachments(CFDictionary 非线程安全), 竞态 →
-// use-after-free → SIGSEGV → mediaserverd 重启 → 全 App 相机黑屏(设备实证: 3 次同栈
-// 崩溃 vcam_crash.txt, 帧链 CMCapture→hook→strip 遍历循环区, 崩溃时机=进程启动 0-2s
-// ×2 + 18min 周期窗口, 与 still 诊断/剥离的并发窗口完全吻合; runs=82)。
-// 照片过曝实验(千面同样过曝)退居 vc.plist "metaFix=YES" 显式开启。
 static BOOL vcamMetaFixCached = NO;
 static time_t vcamMetaFixTS = 0;
 static BOOL vcamMetaFixOn(void) {
@@ -132,7 +154,6 @@ static BOOL vcamMetaFixOn(void) {
     return vcamMetaFixCached;
 }
 
-// 曝光相关附件 key(剥离目标; 颜色附件 Primaries/Transfer/Matrix 不在此列, 不受影响)
 static NSArray *vcamExposureKeys(void) {
     static NSArray *keys;
     static dispatch_once_t once;
@@ -145,7 +166,6 @@ static NSArray *vcamExposureKeys(void) {
     return keys;
 }
 
-// 从 CMSampleBuffer + CVPixelBuffer 双侧剥离曝光元数据(任意 mode 全清)
 static void vcamStripExposureMeta(CMSampleBufferRef sb, CVPixelBufferRef pb) {
     if (!vcamMetaFixOn()) return;
     for (NSString *key in vcamExposureKeys()) {
@@ -155,7 +175,6 @@ static void vcamStripExposureMeta(CMSampleBufferRef sb, CVPixelBufferRef pb) {
     }
 }
 
-// 中心十字 5 点 Y/G 采样(与 VCamCore dumpBufferDiagnostics 同模式)
 static NSString *vcamLumaSamples(CVPixelBufferRef pb) {
     if (!pb) return @"nil";
     size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
@@ -188,9 +207,6 @@ static NSString *vcamTrunc(NSString *s, NSUInteger n) {
     return [NSString stringWithFormat:@"%@...", [s substringToIndex:n]];
 }
 
-// still 到达诊断默认关闭(2026-08-19 UAF 崩溃修复): CMCopyDictionaryOfAttachments +
-// description 遍历与并发 hook 线程的元数据操作/CMCapture 管线访问同一 attachments
-// 字典存在竞态窗口(与 metaFix 同源)。诊断使命已完成, vc.plist "stillDiag=YES" 开启。
 static BOOL vcamStillDiagOn(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -202,7 +218,6 @@ static BOOL vcamStillDiagOn(void) {
     return cached == 1;
 }
 
-// still 管线到达诊断: 像素亮度(定位增益发生段) + 全部附件(找曝光元数据真实 key)
 static void vcamDumpStillArrival(NSString *tag, int idx, CMSampleBufferRef sb, CVPixelBufferRef pb) {
     if (!pb || !vcamStillDiagOn()) return;
     OSType fmt = CVPixelBufferGetPixelFormatType(pb);
@@ -221,27 +236,14 @@ static void vcamDumpStillArrival(NSString *tag, int idx, CMSampleBufferRef sb, C
 
 #pragma mark - Hook 函数原始指针
 
-// BWNodeOutput emitSampleBuffer: 的原始实现
 static void (*orig_BWNodeOutput_emitSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer);
-
-// BWStillImageScalerNode renderSampleBuffer:forInput: 的原始实现
 static void (*orig_BWStillImageScalerNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
-
-// BWPhotoEncoderNode renderSampleBuffer:forInput: 的原始实现
 static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
 
 #pragma mark - Hook 函数实现
 
-// 照片持续缓冲流节流判定(2026-08-16):
-// 实测教训: 照片缓冲流(-8f0 等)参与预览显示, 跳帧 = 预览在替换/真实画面间闪烁
-// (用户可见回归)。默认关闭节流; vc.plist "photoThrottle=YES" 可启用(诊断用,
-// 限 ~7fps, 快门最终帧走 PhotoEncoder hook 不受影响)
 static BOOL vcamPhotoStreamThrottled(OSType fmt) {
-    if (!(fmt == 0x2d386630 /* -8f0 */ ||
-          fmt == 0x7c386630 /* |8f0 */ ||
-          fmt == 0x7c387630 /* |8v0 */)) {
-        return NO;  // 非照片流格式, 不节流
-    }
+    if (!(fmt == 0x2d386630 || fmt == 0x7c386630 || fmt == 0x7c387630)) return NO;
     static int enabled = -1;
     if (enabled < 0) {
         @try {
@@ -252,17 +254,12 @@ static BOOL vcamPhotoStreamThrottled(OSType fmt) {
     if (!enabled) return NO;
     static CFAbsoluteTime lastHandled = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - lastHandled < 0.14) return YES;  // 限 ~7fps
+    if (now - lastHandled < 0.14) return YES;
     lastHandled = now;
     return NO;
 }
 
-// Hook 1: BWNodeOutput emitSampleBuffer:
-// 主预览流 —— 所有 app 的相机预览/录像都经过这里(逆向: 就地改写原 buffer 后调原 IMP,
-// 假帧顺原生管线流向所有下游消费者: 预览/录像编码器/拍照编码器)
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
-    // 诊断: 降频至每 1800 帧(相机多流 30fps 下 ~20s 一条; mediaserverd disk writes
-    // 限额 12.43KB/s, 高频日志按 4KB 脏页/行记账曾引发 EXC_RESOURCE 崩溃循环)
     static int vcamEmitCount = 0;
     vcamEmitCount++;
     if (vcamEmitCount % 1800 == 1) {
@@ -270,32 +267,22 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         OSType fmt = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] emit#%d fmt=0x%x cls=%@", vcamEmitCount, (unsigned)fmt, NSStringFromClass([self class])]);
     }
-    // 逆向逻辑: 只替换 mediaType=='vide' 的帧, 过滤音频/元数据(避免无效处理 + 录像流被漏掉)
     if (sampleBuffer) {
-     @autoreleasepool {   // 卡顿保险(2026-08-19): Apple 相机线程可能无 pool, 防 autorelease 积压
-        // [self mediaType] 返回 CMMediaType (FourCC uint32), 'vide' = kCMMediaType_Video
+     @autoreleasepool {
         @try {
             SEL mediaTypeSel = sel_registerName("mediaType");
             if ([self respondsToSelector:mediaTypeSel]) {
                 uint32_t mt = ((uint32_t(*)(id, SEL))objc_msgSend)(self, mediaTypeSel);
                 if (mt != 'vide') {
-                    // 非视频帧(音频/元数据), 直通原 IMP
-                    if (orig_BWNodeOutput_emitSampleBuffer) {
-                        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-                    }
+                    if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
                     return;
                 }
             }
         } @catch (NSException *e) {}
-        // 就地改写原 sample buffer 的 CVPixelBuffer, 然后调原 IMP 发射(假帧流向所有下游)
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 照片流格式(-8f0/|8f0/|8v0): 到达诊断 + 源头剥离曝光元数据
-            // (防 emit→scaler 之间基于元数据的增益; 视频流/预览流不动, 只动照片流)
             OSType efmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
-            BOOL photoStream = (efmt == 0x2d386630 /* -8f0 */ ||
-                                efmt == 0x7c386630 /* |8f0 */ ||
-                                efmt == 0x7c387630 /* |8v0 */);
+            BOOL photoStream = (efmt == 0x2d386630 || efmt == 0x7c386630 || efmt == 0x7c387630);
             if (photoStream) {
                 vcamPhotoEmitCount++;
                 if (vcamPhotoEmitCount <= 16 || vcamPhotoEmitCount % 3600 == 0) {
@@ -303,101 +290,74 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
                 }
                 vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             }
-            // 照片缓冲流节流: CPU 配额保护(见 vcamPhotoStreamThrottled 注释)
             if (vcamPhotoStreamThrottled(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
-                if (orig_BWNodeOutput_emitSampleBuffer) {
-                    orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-                }
+                if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
                 return;
             }
             @try {
-                // 相机帧 PTS 传入(2026-08-17 卡顿修复): 快照推进按相机帧边界判定,
-                // 同一相机帧的 emit/scaler/encoder 共享 PTS → 共享同一快照内容
-                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
-                                                                     pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+                // 弱调用 VCamCore（类不存在则 no-op）
+                vcam_core_render(pixelBuffer, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)));
             } @catch (NSException *e) {
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] emitSampleBuffer hook exception: %@", e]);
             }
         }
-     }  // autoreleasepool
+     }
     }
-    // 调用原始方法(发射已掉包的 sample buffer)
-    if (orig_BWNodeOutput_emitSampleBuffer) {
-        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-    }
+    if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
 }
 
-// Hook 2: BWStillImageScalerNode renderSampleBuffer:forInput:
-// 照片缩放 —— 拍照时的照片缩放处理
 static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
     if (sampleBuffer) {
-     @autoreleasepool {   // 卡顿保险(2026-08-19): Apple 相机线程可能无 pool, 防 autorelease 积压周期性结算停顿
+     @autoreleasepool {
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 到达诊断(替换前): 若此处像素已亮于 emit 时写入值, 增益发生在 emit→scaler 段
             vcamScalerArrCount++;
             if (vcamScalerArrCount <= 16 || vcamScalerArrCount % 3600 == 0) {
                 vcamDumpStillArrival(@"scaler", vcamScalerArrCount, sampleBuffer, pixelBuffer);
             }
-            // 曝光元数据剥离(防 scaler 内部/下游基于元数据拉增益)
             vcamStripExposureMeta(sampleBuffer, pixelBuffer);
-            // 照片缓冲流节流: CPU 配额保护(emit 侧同一判定; encoder 快门路径不节流)
             if (vcamPhotoStreamThrottled(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
-                if (orig_BWStillImageScalerNode_renderSampleBuffer) {
-                    orig_BWStillImageScalerNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
-                }
+                if (orig_BWStillImageScalerNode_renderSampleBuffer) orig_BWStillImageScalerNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
                 return;
             }
             @try {
-                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
-                                                                     pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+                vcam_core_render(pixelBuffer, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)));
             } @catch (NSException *e) {
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] ScalerNode hook exception: %@", e]);
             }
         }
-     }  // autoreleasepool
+     }
     }
-    if (orig_BWStillImageScalerNode_renderSampleBuffer) {
-        orig_BWStillImageScalerNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
-    }
+    if (orig_BWStillImageScalerNode_renderSampleBuffer) orig_BWStillImageScalerNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
 }
 
-// Hook 3: BWPhotoEncoderNode renderSampleBuffer:forInput:
-// 照片编码 —— 保存的照片经过这里
 static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
     if (sampleBuffer) {
-     @autoreleasepool {   // 卡顿保险: 同 Hook2
+     @autoreleasepool {
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 到达诊断(替换前): 若此处正常而最终照片过曝, 增益发生在编码器内部(元数据剥离是唯一机会)
             vcamEncoderArrCount++;
             if (vcamEncoderArrCount <= 16 || vcamEncoderArrCount % 3600 == 0) {
                 vcamDumpStillArrival(@"encoder", vcamEncoderArrCount, sampleBuffer, pixelBuffer);
             }
-            // 曝光元数据剥离(编码前最后机会)
             vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             @try {
-                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
-                                                                     pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+                vcam_core_render(pixelBuffer, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)));
             } @catch (NSException *e) {
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
             }
         }
-     }  // autoreleasepool
+     }
     }
-    if (orig_BWPhotoEncoderNode_renderSampleBuffer) {
-        orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
-    }
+    if (orig_BWPhotoEncoderNode_renderSampleBuffer) orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
 }
 
 #pragma mark - Hook 安装
 
 static void installMediaserverdHooks(void) {
-    // Hook 1: BWNodeOutput emitSampleBuffer:
     Class bwNodeOutput = objc_getClass("BWNodeOutput");
     if (bwNodeOutput) {
-        MSHookMessageEx(bwNodeOutput,
-                        @selector(emitSampleBuffer:),
+        MSHookMessageEx(bwNodeOutput, @selector(emitSampleBuffer:),
                         (IMP)hook_BWNodeOutput_emitSampleBuffer,
                         (IMP *)&orig_BWNodeOutput_emitSampleBuffer);
         vcam_tweak_log(@"[vcam] Hooked BWNodeOutput emitSampleBuffer:");
@@ -405,11 +365,9 @@ static void installMediaserverdHooks(void) {
         vcam_tweak_log(@"[vcam] BWNodeOutput class not found");
     }
 
-    // Hook 2: BWStillImageScalerNode renderSampleBuffer:forInput:
     Class bwStillImageScaler = objc_getClass("BWStillImageScalerNode");
     if (bwStillImageScaler) {
-        MSHookMessageEx(bwStillImageScaler,
-                        @selector(renderSampleBuffer:forInput:),
+        MSHookMessageEx(bwStillImageScaler, @selector(renderSampleBuffer:forInput:),
                         (IMP)hook_BWStillImageScalerNode_renderSampleBuffer,
                         (IMP *)&orig_BWStillImageScalerNode_renderSampleBuffer);
         vcam_tweak_log(@"[vcam] Hooked BWStillImageScalerNode renderSampleBuffer:forInput:");
@@ -417,11 +375,9 @@ static void installMediaserverdHooks(void) {
         vcam_tweak_log(@"[vcam] BWStillImageScalerNode class not found");
     }
 
-    // Hook 3: BWPhotoEncoderNode renderSampleBuffer:forInput:
     Class bwPhotoEncoder = objc_getClass("BWPhotoEncoderNode");
     if (bwPhotoEncoder) {
-        MSHookMessageEx(bwPhotoEncoder,
-                        @selector(renderSampleBuffer:forInput:),
+        MSHookMessageEx(bwPhotoEncoder, @selector(renderSampleBuffer:forInput:),
                         (IMP)hook_BWPhotoEncoderNode_renderSampleBuffer,
                         (IMP *)&orig_BWPhotoEncoderNode_renderSampleBuffer);
         vcam_tweak_log(@"[vcam] Hooked BWPhotoEncoderNode renderSampleBuffer:forInput:");
@@ -434,33 +390,19 @@ static void installMediaserverdHooks(void) {
 
 static void initializeInMediaserverd(void) {
     vcam_tweak_log(@"[vcam] Initializing in mediaserverd...");
-
-    // 初始化 VCamCore（会启动 plist 轮询）
-    [[VCamCore sharedInstance] initializeInMediaserverd];
-
-    // 安装 3 个 hook
+    vcam_core_init_msd();
     installMediaserverdHooks();
-
     vcam_tweak_log(@"[vcam] MediaServerd hooks initialized");
 }
 
 static void initializeInSpringBoard(void) {
     vcam_tweak_log(@"[vcam] SpringBoard hooks initialized");
-
-    // 初始化 VCamCore（状态轮询）
-    [[VCamCore sharedInstance] initializeInSpringBoard];
-
-    // 显示悬浮球
-    [[VCamFloatingBall sharedInstance] showFloatingBall];
+    vcam_core_init_sb();
+    vcam_ball_show();
 }
 
 #pragma mark - 入口
 
-// ===== SIGSEGV 崩溃捕获器(2026-08-19 首次进入黑屏取证) =====
-// 设备实证(launchctl): "last terminating signal = Segmentation fault: 11" ——
-// msd 首次相机建图期被 SIGSEGV 干掉(App 重进即正常), 且系统侧无 .ips 落盘。
-// 捕获器在崩溃瞬间把 backtrace 写 /tmp/vcam_crash.txt(低频一次性写入,
-// 磁盘配额安全), 然后恢复默认处理让系统走原终止流程。
 static void vcam_crash_handler(int sig, siginfo_t *info, void *ucontext) {
     (void)ucontext;
     int fd = open("/tmp/vcam_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -492,11 +434,6 @@ static void vcam_install_crash_handler(void) {
     sigaction(SIGILL, &sa, NULL);
 }
 
-// 双布局加载防重入(2026-08-20, SE2 兼容): deb 同时落 TweakInject 与
-// DynamicLibraries(千面布局, roothidepatch 标记) 两处, 不同 loader 扫描
-// 机制不同 —— 若某设备两条路径都被加载, 同一 dylib 会以两个镜像身份进入
-// 进程(不同真实路径 dyld 不去重) → 双重 hook + 双悬浮球 + 双解码管线。
-// 后到的镜像在 constructor 检测到"同 basename 不同路径"的已加载镜像即退出。
 static void vcamInit(void);
 
 static BOOL vcam_loaded_via_other_path(void) {
@@ -511,16 +448,11 @@ static BOOL vcam_loaded_via_other_path(void) {
         if (!p || strcmp(p, selfPath) == 0) continue;
         const char *base = strrchr(p, '/');
         base = base ? base + 1 : p;
-        if (strcmp(base, selfBase) == 0) return YES;  // 同名 dylib 已从另一路径加载
+        if (strcmp(base, selfBase) == 0) return YES;
     }
     return NO;
 }
 
-// 无条件加载信标(2026-08-21, 1.3.21): 注入排查专用 —— 不受 logEnabled 影响
-// (roothide 新视图下进程内 /var/mobile 与 /rootfs 双路径读取可能都失败导致
-// 日志静默, 无法区分"没加载"与"加载了但日志被吞"); 每进程加载只写一次
-// (~100B, 无磁盘配额风险), 写多个候选路径覆盖 shell/daemon/app 不同视图的
-// /tmp 语义(DCIM 媒体目录路径 SSH 必可读)。
 static void vcam_load_beacon(NSString *processName) {
     NSString *line = [NSString stringWithFormat:@"[%@] loaded in %@ (pid %d)\n",
                       [NSDate date], processName, getpid()];
@@ -545,27 +477,25 @@ static void vcam_load_beacon(NSString *processName) {
 __attribute__((constructor))
 static void vcamInit(void) {
     @autoreleasepool {
-        if (vcam_loaded_via_other_path()) return;  // 双布局防重入
+        if (vcam_loaded_via_other_path()) return;
         NSString *processName = [[NSProcessInfo processInfo] processName];
-        vcam_load_beacon(processName);  // 无条件信标: 注入可见性诊断
+        vcam_load_beacon(processName);
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loading in process: %@", processName]);
 
         if ([processName isEqualToString:@"mediaserverd"]) {
-            vcam_install_crash_handler();  // 崩溃取证: SIGSEGV backtrace 落盘
+            vcam_install_crash_handler();
             initializeInMediaserverd();
         } else if ([processName isEqualToString:@"SpringBoard"]) {
             initializeInSpringBoard();
         } else {
-            // lskdd 等其他进程也加载（plist 中配置了）
             vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loaded in other process: %@", processName]);
-            [[VCamCore sharedInstance] initializeInMediaserverd];
+            vcam_core_init_msd();
         }
     }
 }
 
-// destructor（卸载时清理）
 __attribute__((destructor))
 static void vcamDeinit(void) {
     vcam_tweak_log(@"[vcam] Unloading...");
-    [[VCamCore sharedInstance] stopStatePolling];
+    vcam_core_stop_polling();
 }
