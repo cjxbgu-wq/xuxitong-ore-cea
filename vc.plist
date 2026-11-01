@@ -24,9 +24,11 @@
     <true/>
     <key>lightColor</key>
     <integer>0</integer>
-    <key>injectMode</key>
-    <integer>0</integer>
-    <key>vesselInjectAlpha</key>
+    <key>lightLuma</key>
+    <real>0.5</real>
+    <key>vesselFaceLocked</key>
+    <false/>
+    <key>injectAlpha</key>
     <real>0.35</real>
     <key>logEnabled</key>
     <true/>
