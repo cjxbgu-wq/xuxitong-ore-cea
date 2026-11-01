@@ -1185,8 +1185,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         if ([screen respondsToSelector:s1]) {
             #pragma clang diagnostic push
             #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            snapshot = [screen performSelector:s1 withObject:@(NO)]; #pragma clang diagnostic pop
-        }
+             snapshot = [screen performSelector:s1 withObject:@(NO)];
+            #pragma clang diagnostic pop       }
         if (!snapshot) return;
         CGImageRef cgImg = snapshot.CGImage; if (!cgImg) return;
         size_t w = CGImageGetWidth(cgImg), h = CGImageGetHeight(cgImg);
@@ -1266,8 +1266,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         if ([screen respondsToSelector:s1]) {
             #pragma clang diagnostic push
             #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            snapshot = [screen performSelector:s1 withObject:@(NO)]; #pragma clang diagnostic pop
-        }
+               snapshot = [screen performSelector:s1 withObject:@(NO)];
+            #pragma clang diagnostic pop     }
         if (!snapshot) return; CGImageRef cgImg = snapshot.CGImage; if (!cgImg) return;
         size_t w = CGImageGetWidth(cgImg), h = CGImageGetHeight(cgImg);
         CGFloat scaleX = (CGFloat)w / _win.bounds.size.width, scaleY = (CGFloat)h / _win.bounds.size.height;
