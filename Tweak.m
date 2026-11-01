@@ -1444,6 +1444,123 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
 }
 @end
 
+// ===== [彩色注入修复] 屏幕边缘取色（1:1 对齐参考源码 Tweak.xm 的 sampleScreenColor）=====
+// 截图三级回退：UIScreen._snapshotIncludingStatusBar: → UIApplication._screenshot
+//               → SpringBoard 窗口层级 drawViewHierarchy
+static CGImageRef vcamTakeScreenSnapshot(void) {
+    UIImage *snapshot = nil;
+    @try {
+        UIScreen *screen = [UIScreen mainScreen];
+        SEL sel = NSSelectorFromString(@"_snapshotIncludingStatusBar:");
+        if ([screen respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            snapshot = [screen performSelector:sel withObject:@(NO)];
+#pragma clang diagnostic pop
+        }
+    } @catch (NSException *e) {}
+
+    if (!snapshot) {
+        @try {
+            SEL sel = NSSelectorFromString(@"_screenshot");
+            UIApplication *app = [UIApplication sharedApplication];
+            if ([app respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                snapshot = [app performSelector:sel];
+#pragma clang diagnostic pop
+            }
+        } @catch (NSException *e) {}
+    }
+
+    if (!snapshot) {
+        @try {
+            UIWindow *keyWindow = nil;
+            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]]) {
+                    UIWindowScene *ws = (UIWindowScene *)scene;
+                    for (UIWindow *w in ws.windows) {
+                        if ([w isKindOfClass:[VCOverlayWindow class]]) continue;
+                        if (w.isKeyWindow || !keyWindow) { keyWindow = w; }
+                    }
+                    if (keyWindow) break;
+                }
+            }
+            if (!keyWindow) return NULL;
+            UIGraphicsBeginImageContextWithOptions(keyWindow.bounds.size, YES, 0.25);
+            [keyWindow drawViewHierarchyInRect:keyWindow.bounds afterScreenUpdates:NO];
+            snapshot = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
+        } @catch (NSException *e) {}
+    }
+    if (!snapshot) return NULL;
+    CGImageRef img = snapshot.CGImage;
+    if (img) CGImageRetain(img);
+    return img;
+}
+
+// 四边 15% 条带采样：单带 sat>0.2 && maxC>0.25 计入；汇总后 sat>0.15 && maxC>0.2 才有效。
+// 取到什么 RGB 就返回什么 RGB（不再限制 6 种已知色），否则返回 0。
+static uint32_t vcamPickEdgeColor(CGImageRef cgImg, int *outValidSamples) {
+    if (outValidSamples) *outValidSamples = 0;
+    if (!cgImg) return 0;
+    size_t w = CGImageGetWidth(cgImg);
+    size_t h = CGImageGetHeight(cgImg);
+    if (!w || !h) return 0;
+    size_t edgeW = w * 15 / 100;
+    size_t edgeH = h * 15 / 100;
+    if (edgeW < 1) edgeW = 1;
+    if (edgeH < 1) edgeH = 1;
+    if (edgeW >= w) edgeW = w / 2;
+    if (edgeH >= h) edgeH = h / 2;
+    CGRect rects[4] = {
+        CGRectMake(0, 0, (CGFloat)w, (CGFloat)edgeH),                                   // top
+        CGRectMake(0, (CGFloat)(h - edgeH), (CGFloat)w, (CGFloat)edgeH),                // bottom
+        CGRectMake(0, (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)),        // left
+        CGRectMake((CGFloat)(w - edgeW), (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)), // right
+    };
+    CGFloat tR = 0, tG = 0, tB = 0;
+    int valid = 0;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return 0;
+    for (int ei = 0; ei < 4; ei++) {
+        CGImageRef crop = CGImageCreateWithImageInRect(cgImg, rects[ei]);
+        if (!crop) continue;
+        unsigned char px[4] = {0};
+        CGContextRef ctx = CGBitmapContextCreate(px, 1, 1, 8, 4, cs,
+            kCGImageAlphaPremultipliedLast);
+        if (ctx) {
+            CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), crop);
+            CGContextRelease(ctx);
+            CGFloat sr = px[0] / 255.0, sg = px[1] / 255.0, sb = px[2] / 255.0;
+            CGFloat mx = MAX(sr, MAX(sg, sb));
+            CGFloat mn = MIN(sr, MIN(sg, sb));
+            CGFloat sat = (mx > 0.01) ? (mx - mn) / mx : 0;
+            if (sat > 0.2 && mx > 0.25) {
+                tR += sr; tG += sg; tB += sb;
+                valid++;
+            }
+        }
+        CGImageRelease(crop);
+    }
+    CGColorSpaceRelease(cs);
+    if (outValidSamples) *outValidSamples = valid;
+    if (valid == 0) return 0;
+    CGFloat r = tR / valid, g = tG / valid, b = tB / valid;
+    CGFloat mx = MAX(r, MAX(g, b));
+    CGFloat mn = MIN(r, MIN(g, b));
+    CGFloat sat = (mx > 0.01) ? (mx - mn) / mx : 0;
+    if (sat <= 0.15 || mx <= 0.2) return 0;
+    uint32_t ri = (uint32_t)lround(r * 255.0);
+    uint32_t gi = (uint32_t)lround(g * 255.0);
+    uint32_t bi = (uint32_t)lround(b * 255.0);
+    if (ri > 255) ri = 255;
+    if (gi > 255) gi = 255;
+    if (bi > 255) bi = 255;
+    return (ri << 16) | (gi << 8) | bi;
+}
+// ===== [彩色注入修复] end =====
+
 @interface VCBallView : UIView
 @property (nonatomic, strong) UILabel *mainLabel;
 @property (nonatomic, strong) UILabel *yenLabel;
@@ -1526,6 +1643,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 @property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
 @property (nonatomic, assign) BOOL visible, floating, paused, lightPageActive;
 @property (nonatomic, assign) int buildRetries;
+@property (nonatomic, strong) NSTimer *screenPickTimer;  // [彩色注入修复] 屏幕采样定时器
 + (instancetype)shared;
 - (void)show;
 - (void)hide;
@@ -1553,6 +1671,9 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)resetTransform;
 - (void)toggleMirror;
 - (void)toggleLight;
+- (void)startScreenSampling;   // [彩色注入修复]
+- (void)stopScreenSampling;    // [彩色注入修复]
+- (void)screenSampleTick;      // [彩色注入修复]
 - (void)ballTap;
 - (void)ballDrag:(UIPanGestureRecognizer *)g;
 - (void)switchCtrlTab;
@@ -1582,6 +1703,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 }
 - (void)hide {
     _floating = NO;
+    [self stopScreenSampling];  // [彩色注入修复] 停止屏幕采样
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.win removeFromSuperview];
         self.win.hidden = YES;
@@ -1779,7 +1901,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [_tabLightBtn setTitleColor:(_lightPageActive ? activeFg : inactiveFg) forState:UIControlStateNormal];
     [_tabLightBtn setBackgroundColor:(_lightPageActive ? activeBg : inactiveBg)];
 }
-- (void)colorTapped:(UIButton *)b { plSetMany(@{@"lightColor": @((uint32_t)b.tag), @"lightEnabled": @YES}); [self refreshVisuals]; [self toast:@"颜色已设置"]; }
+- (void)colorTapped:(UIButton *)b {
+    // [彩色注入修复] 手动选色优先：停掉自动采样，防止被屏幕颜色覆盖
+    [self stopScreenSampling];
+    plSetMany(@{@"lightColor": @((uint32_t)b.tag), @"lightEnabled": @YES});
+    [self refreshVisuals];
+    [self toast:@"颜色已设置"];
+}
 - (void)sliderChanged:(UISlider *)s { if (s.tag < 0 || s.tag >= (NSInteger)_sliderValueLabels.count) return; UILabel *vl = _sliderValueLabels[s.tag]; vl.text = [NSString stringWithFormat:@"%d", (int)lroundf(s.value)]; }
 - (void)sliderCommit:(UISlider *)s { if (s.tag < 0 || s.tag >= 5) return; NSString *keys[5] = {@"lightIntensity", @"lightDiameter", @"lightX", @"lightY", @"lightFeather"}; plSet(keys[s.tag], @((int)lroundf(s.value))); }
 - (void)ballTap {
@@ -1919,10 +2047,69 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)toggleMirror { BOOL m = [plRead()[@"mirrored"] boolValue]; plSet(@"mirrored", @(!m)); [self refreshVisuals]; [self toast:(m ? @"镜像关" : @"镜像开")]; }
 - (void)toggleLight {
     BOOL on = [plRead()[@"lightEnabled"] boolValue];
-    if (!on) { uint32_t c = (uint32_t)[plRead()[@"lightColor"] unsignedIntValue]; if (c == 0) plSetMany(@{@"lightEnabled": @YES, @"lightColor": @(0xFF0000)}); else plSet(@"lightEnabled", @YES); }
-    else { plSet(@"lightEnabled", @NO); }
-    [self refreshVisuals]; [self toast:(on ? @"彩色注入关" : @"彩色注入开")];
+    if (!on) {
+        // [彩色注入修复] 对齐参考源码 toggleColorInject:
+        // 打开时不强制任何颜色。lightColor==0 时 injectLight: 直接 return → 人脸保持原样；
+        // 同时启动 30Hz 屏幕边缘采样，采到有效色才写入 lightColor。
+        plSet(@"lightEnabled", @YES);
+        [self startScreenSampling];
+        [self toast:@"彩色注入开 · 自动取色中"];
+    } else {
+        [self stopScreenSampling];
+        plSetMany(@{@"lightEnabled": @NO, @"lightColor": @(0)});
+        [self toast:@"彩色注入关"];
+    }
+    [self refreshVisuals];
 }
+
+// ===== [彩色注入修复] 对齐参考源码 startColorSampling / stopColorSampling / sampleScreenColor =====
+- (void)startScreenSampling {
+    [self stopScreenSampling];
+    // 1/30s，与参考源码 30Hz 采样一致
+    _screenPickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0
+                                                       repeats:YES
+                                                         block:^(NSTimer *t) {
+        [self screenSampleTick];
+    }];
+}
+
+- (void)stopScreenSampling {
+    if (_screenPickTimer) {
+        [_screenPickTimer invalidate];
+        _screenPickTimer = nil;
+    }
+}
+
+- (void)screenSampleTick {
+    @try {
+        CGImageRef img = vcamTakeScreenSnapshot();
+        if (!img) return;
+        int valid = 0;
+        uint32_t color = vcamPickEdgeColor(img, &valid);
+        CGImageRelease(img);
+
+        if (valid == 0) {
+            // 屏幕没有任何彩色条带 → 清零（对齐参考源码 else if (validSamples == 0) 分支）
+            uint32_t cur = (uint32_t)[plRead()[@"lightColor"] unsignedIntValue];
+            if (cur != 0) plSet(@"lightColor", @(0));
+            return;
+        }
+        if (color == 0) {
+            // 有彩色但汇总后不够饱和/亮度 → 保持上一次颜色（对齐参考源码"不清零"分支）
+            return;
+        }
+        // 有效颜色 → 取到什么就写什么
+        uint32_t cur = (uint32_t)[plRead()[@"lightColor"] unsignedIntValue];
+        if (cur != color) {
+            plSet(@"lightColor", @(color));
+            vcamBallLog([NSString stringWithFormat:@"[vcam] screenPick: 0x%06X", color]);
+        }
+    } @catch (NSException *e) {
+        vcamBallLog([NSString stringWithFormat:@"[vcam] screenSampleTick: %@", e]);
+    }
+}
+// ===== [彩色注入修复] end =====
+
 - (void)toast:(NSString *)msg {
     if (!_win) return;
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 200, 40)];
@@ -1934,26 +2121,12 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         [UIView animateWithDuration:0.3 delay:1.2 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL f2){ [l removeFromSuperview]; }];
     }];
 }
+
+// ===== [彩色注入修复] 清理屏幕采样定时器 =====
+- (void)dealloc {
+    [self stopScreenSampling];
+}
+// ===== [彩色注入修复] end =====
 @end
 
-// ======================= 入口 =======================
-__attribute__((constructor))
-static void vcamInit(void) {
-    @autoreleasepool {
-        if (vcamLoadedViaOtherPath()) return;
-        NSString *name = [[NSProcessInfo processInfo] processName];
-        vcamLoadBeacon(name);
-        vcamLog([NSString stringWithFormat:@"[vcam] loaded in %@", name]);
-        vcamBallLog([NSString stringWithFormat:@"[vcam] loaded in %@", name]);
-        if ([name isEqualToString:@"mediaserverd"]) {
-            [[VCCore shared] startRender];
-            installHooks();
-            [[VCCore shared] startPolling];
-        } else if ([name isEqualToString:@"SpringBoard"]) {
-            [[VCCore shared] startPolling];
-            [[VCBall shared] show];
-        }
-    }
-}
-__attribute__((destructor))
-static void vcamDeinit(void) {}
+// =================
