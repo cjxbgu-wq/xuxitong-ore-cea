@@ -92,6 +92,7 @@ static NSString *vcamKnownLightName(int idx) {
     return @"?";
 }
 
+__attribute__((unused))
 static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount) {
     int counts[6] = {0};
     for (int i = 0; i < n; i++) {
@@ -118,6 +119,37 @@ static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outNa
         return vcamKnownLights[bestK];
     }
     return 0;
+}
+
+// 从取色区域直接提取代表色：过滤过暗/过灰像素，按饱和度加权平均。
+// 不再限制为 6 种已知色，实现"取什么颜色映射什么颜色"。
+static uint32_t vcamPickDominantColor(const uint8_t *rgba, int n,
+                                      NSString **outName, int *outCount) {
+    if (outName) *outName = nil;
+    if (outCount) *outCount = 0;
+    if (!rgba || n <= 0) return 0;
+
+    double sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+    int valid = 0;
+    for (int i = 0; i < n; i++) {
+        int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
+        if (maxc < 40) continue;            // 太暗(黑/深灰)丢弃
+        int sat = maxc - minc;
+        if (sat < 20) continue;             // 太灰(白/灰背景)丢弃
+        double w = (double)sat;             // 越饱和权重越高
+        sumR += r * w; sumG += g * w; sumB += b * w; sumW += w;
+        valid++;
+    }
+    if (valid < 10 || sumW <= 0) return 0;  // 区域没有有效彩色
+    int r = (int)lround(sumR / sumW);
+    int g = (int)lround(sumG / sumW);
+    int b = (int)lround(sumB / sumW);
+    r = MAX(0, MIN(255, r));
+    g = MAX(0, MIN(255, g));
+    b = MAX(0, MIN(255, b));
+    if (outCount) *outCount = valid;
+    return (uint32_t)((r << 16) | (g << 8) | b);
 }
 
 typedef NS_ENUM(int, VcamPickPortStrategy) {
@@ -266,6 +298,7 @@ static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
 @property (nonatomic, strong) dispatch_queue_t colorPickQueue;
 @property (nonatomic, strong) dispatch_source_t colorPickTimer;
 @property (nonatomic, assign) BOOL pickSuspended;
+@property (nonatomic, assign) BOOL pickArmed;           // 用户已点击"屏幕取色: 开"，等待有效颜色
 @property (nonatomic, assign) int pickSkipCount;
 @property (nonatomic, assign) uint32_t lastDetectedColor;
 @property (nonatomic, assign) uint64_t lastPickSeq;
@@ -290,6 +323,7 @@ static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
         _panelVisible = NO;
         _isFloating = NO;
         _isPaused = NO;
+        _pickArmed = NO;
     }
     return self;
 }
@@ -306,6 +340,7 @@ static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
 - (void)hideFloatingBall {
     if (!_isFloating) return;
     _isFloating = NO;
+    _pickArmed = NO;
     [self stopColorPickup];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.overlayWindow removeFromSuperview];
@@ -646,17 +681,25 @@ static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
 
     [_overlayWindow addSubview:_panelView];
 
-    // 恢复打光状态（如果有）
-    // 修复：respring/重建面板时即使 plist 残留旧 lightColor，也强制清 0，
-    // 必须重新移动准星吸到颜色才注入。旧逻辑直接 _lastDetectedColor =
-    // plistLightColor 会让旧红色在恢复瞬间打在人脸上。
-    if ([VCamNotify plistLightEnabled]) {
-        [VCamNotify setPlistLightColor:0];
-        _lastDetectedColor = 0;
-        _pickSkipCount = 1;
+    // 恢复打光：仅当之前确实取到过有效颜色(lightColor != 0)才自动恢复；
+    // 否则强制关闭，避免 0 被 VCamCore 当作红色
+    uint32_t savedLightColor = [VCamNotify plistLightColor];
+    if ([VCamNotify plistLightEnabled] && savedLightColor != 0) {
+        _pickArmed = YES;
+        _lastDetectedColor = savedLightColor;
+        _pickSkipCount = 3;
         [self showPickDot];
         [self startColorPickup];
         [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
+        [self updateColorPreview:_lastDetectedColor];
+    } else {
+        if ([VCamNotify plistLightEnabled]) {
+            [VCamNotify setPlistLightEnabled:NO];
+        }
+        [VCamNotify setPlistLightColor:0];
+        _pickArmed = NO;
+        _lastDetectedColor = 0;
+        [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
         [self updateColorPreview:0];
     }
 }
@@ -719,30 +762,24 @@ static NSString *vcamLightColorName(uint32_t c) {
 
 - (void)pickColorTapped {
     [self haptic:UIImpactFeedbackStyleMedium];
-    BOOL on = ![VCamNotify plistLightEnabled];
-    if (on) {
-        // 关键顺序修复：先清颜色，再开取色模式。
-        // 若先 setPlistLightEnabled:YES 再 setPlistLightColor:0，
-        // mediaserverd 0.04s 轮询可能在两步之间读到 enabled=YES + 旧 lightColor，
-        // 把旧颜色打脸上（用户看到的"打开就是红色遮蔽"）。
-        // 清色后 lightColor=0 → 注入端直通 → 人脸不变，
-        // 必须等 colorPickTick 检测到有效颜色写回 lightColor 才开始注入。
+    if (!_pickArmed) {
+        _pickArmed = YES;
+        // 关键：未取到颜色前关闭打光，避免 VCamCore 把 lightColor=0 当红色
+        [VCamNotify setPlistLightEnabled:NO];
         [VCamNotify setPlistLightColor:0];
-        [VCamNotify setPlistLightEnabled:YES];
         _lastDetectedColor = 0;
-        _pickSkipCount = 1;   // 点击即取色(原 3 拍=120ms, 改 40ms 无等待感)
+        _pickSkipCount = 3;
         [self showPickDot];
         [self startColorPickup];
         [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
         [self updateColorPreview:0];
-        [self toast:@"取色已开启，请在屏幕上打出颜色"];
+        [self toast:@"取色已开启，请对准颜色"];
     } else {
-        // 关闭：先停检测/隐藏准星，再双清(lightEnabled + lightColor)，
-        // 避免 VCamCore 下拍轮询把旧开关/旧颜色带回来
+        _pickArmed = NO;
         [self stopColorPickup];
         [self hidePickDot];
-        [VCamNotify setPlistLightColor:0];
         [VCamNotify setPlistLightEnabled:NO];
+        [VCamNotify setPlistLightColor:0];
         _lastDetectedColor = 0;
         [self updateColorPreview:0];
         [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
@@ -782,7 +819,7 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
         _pickSuspended = NO;
-        _pickSkipCount = 1;   // 松手下一拍(≤40ms)立即取色(原 3 拍=120ms)
+        _pickSkipCount = 3;
         gVcamPick.px = c.x;
         gVcamPick.py = c.y;
         NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
@@ -854,7 +891,7 @@ static NSString *vcamLightColorName(uint32_t c) {
                 CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
                 const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
                 if (rgba) {
-                    detected = vcamMatchKnownLight(rgba, 441, outName, outCount);
+                    detected = vcamPickDominantColor(rgba, 441, outName, outCount);
                 }
                 CGContextRelease(bctx);
             }
@@ -896,17 +933,26 @@ static NSString *vcamLightColorName(uint32_t c) {
         detected = [self detectWithUICreateScreenImage:&detName count:&detCount];
     }
 
-    // 只写 lightColor：
-    //   detected!=0 → 注入该颜色；
-    //   detected==0 → lightColor=0，注入函数直通，人脸恢复原样。
-    // 不动 lightEnabled —— 它是"取色模式"开关，只由 pickColorTapped 控制。
     if (detected != _lastDetectedColor) {
         _lastDetectedColor = detected;
-        [VCamNotify setPlistLightColor:detected];
-        uint32_t d = detected;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self updateColorPreview:d];
-        });
+        if (detected != 0) {
+            // 有效颜色：写入颜色并开启打光（首次开启时才翻 lightEnabled）
+            [VCamNotify setPlistLightColor:detected];
+            if (![VCamNotify plistLightEnabled]) {
+                [VCamNotify setPlistLightEnabled:YES];
+            }
+            uint32_t d = detected;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self updateColorPreview:d];
+            });
+        } else {
+            // 颜色丢失：立即关打光并清色，绝不把 0 留给 VCamCore
+            [VCamNotify setPlistLightEnabled:NO];
+            [VCamNotify setPlistLightColor:0];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self updateColorPreview:0];
+            });
+        }
     }
 }
 
