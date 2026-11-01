@@ -647,13 +647,23 @@ static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
     [_overlayWindow addSubview:_panelView];
 
     // 恢复打光状态（如果有）
+    // 修复"打开彩色注入就是红色遮蔽"：
+    //   respring/重建面板时即使 plist 里残留旧 lightColor，也强制清 0，
+    //   必须重新移动准星吸到颜色才注入。旧逻辑直接 _lastDetectedColor =
+    //   plistLightColor 会让旧红色在恢复瞬间打在人脸上。
+    // 契约说明：
+    //   lightEnabled = 取色模式开关（准星在不在、检测线程跑不跑）
+    //   lightColor   = 注入颜色（0 = 直通，不注入；非 0 = 注入该色）
+    //   注入端 GPUImageProcessor injectLightIntoFrame 判 !lightEnabled || color==0 直通。
     if ([VCamNotify plistLightEnabled]) {
-        _lastDetectedColor = [VCamNotify plistLightColor];
-        _pickSkipCount = 3;
+        [VCamNotify setPlistLightColor:0];
+        _lastDetectedColor = 0;
+        _pickSkipCount = 1;   // 准星出现即开始取色(40ms, 无等待感)
         [self showPickDot];
         [self startColorPickup];
         [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
-        [self updateColorPreview:_lastDetectedColor];
+        [self updateColorPreview:0];
+        vcam_ball_log(@"[vcam][light] pickup state restored (color cleared, re-pick required)");
     }
 }
 
@@ -716,24 +726,35 @@ static NSString *vcamLightColorName(uint32_t c) {
 - (void)pickColorTapped {
     [self haptic:UIImpactFeedbackStyleMedium];
     BOOL on = ![VCamNotify plistLightEnabled];
-    [VCamNotify setPlistLightEnabled:on];
     if (on) {
-        // 强制清空颜色，保证没吸到色之前绝对不往脸上涂默认色
+        // 关键顺序(修复"打开瞬间闪旧色")：先清颜色，再开取色模式。
+        // 若先 setPlistLightEnabled:YES 再 setPlistLightColor:0，
+        // mediaserverd 0.04s 轮询可能在两步之间读到 enabled=YES+旧色，
+        // 把旧颜色打到脸上。
+        // 清色后 lightColor=0 → 注入函数直通 → 人脸完全不变，
+        // 必须等 colorPickTick 检测到有效颜色写回 lightColor 才开始打光。
         [VCamNotify setPlistLightColor:0];
+        [VCamNotify setPlistLightEnabled:YES];
         _lastDetectedColor = 0;
-        _pickSkipCount = 3;
+        _pickSkipCount = 1;   // 只跳 1 拍(40ms)：点击即取色，无等待感（原 3 拍=120ms）
         [self showPickDot];
         [self startColorPickup];
         [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
-        [self toast:@"取色已开启，请在屏幕上打出颜色"];
+        [self updateColorPreview:0];
+        [self toast:@"取色已开启，移动准星吸取颜色"];
+        vcam_ball_log(@"[vcam][light] screen color pickup ON (no injection until color detected)");
     } else {
+        // 关闭：先停检测/隐藏准星，再双清(lightEnabled + lightColor)，
+        // 避免 VCamCore 下拍轮询把旧开关/旧颜色带回来
         [self stopColorPickup];
         [self hidePickDot];
         [VCamNotify setPlistLightColor:0];
+        [VCamNotify setPlistLightEnabled:NO];
         _lastDetectedColor = 0;
         [self updateColorPreview:0];
         [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
         [self toast:@"取色已关闭"];
+        vcam_ball_log(@"[vcam][light] screen color pickup OFF (injection stopped)");
     }
 }
 
@@ -765,11 +786,11 @@ static NSString *vcamLightColorName(uint32_t c) {
     _pickDotView.center = c;
     [g setTranslation:CGPointZero inView:_overlayWindow];
     if (g.state == UIGestureRecognizerStateBegan) {
-        _pickSuspended = YES;
+        _pickSuspended = YES;   // 拖动中暂停(手指物理遮挡采样区, 采样无意义)
     }
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
         _pickSuspended = NO;
-        _pickSkipCount = 3;
+        _pickSkipCount = 1;     // 松手下一拍(≤40ms)立即取色(原 3 拍=120ms)
         gVcamPick.px = c.x;
         gVcamPick.py = c.y;
         NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
@@ -777,6 +798,7 @@ static NSString *vcamLightColorName(uint32_t c) {
         dict[@"lightPickX"] = @(c.x);
         dict[@"lightPickY"] = @(c.y);
         [dict writeToFile:VCamPlistPath atomically:YES];
+        vcam_ball_log([NSString stringWithFormat:@"[vcam][light] pick dot moved to (%.0f,%.0f)", c.x, c.y]);
     }
 }
 
@@ -885,11 +907,20 @@ static NSString *vcamLightColorName(uint32_t c) {
 
     if (detected != _lastDetectedColor) {
         _lastDetectedColor = detected;
+        // 只写 lightColor：
+        //   detected!=0 → 注入该颜色
+        //   detected==0 → lightColor=0，注入函数直通，人脸恢复原样
+        // 不动 lightEnabled —— 它是"取色模式"开关，只由 pickColorTapped 控制。
+        // 准星移到灰/白/面板上检测不到已知色时写 0 让光斑熄灭，
+        // 而不是偷偷把取色模式关掉。
         [VCamNotify setPlistLightColor:detected];
         uint32_t d = detected;
         dispatch_async(dispatch_get_main_queue(), ^{
             [self updateColorPreview:d];
         });
+        vcam_ball_log([NSString stringWithFormat:
+            @"[vcam][light] color detected: 0x%06x %@ (%d/441)", d,
+            detName ?: @"熄灭", detCount]);
     }
 }
 
