@@ -21,7 +21,7 @@
     <key>vesselFlowEnabled</key>
     <true/>
     <key>lightEnabled</key>
-    <true/>
+    <false/>
     <key>lightColor</key>
     <integer>0</integer>
     <key>lightLuma</key>
