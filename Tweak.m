@@ -5,6 +5,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
@@ -666,7 +667,6 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     if (_toCam) VTPixelTransferSessionInvalidate(_toCam);
 }
 @end
-
 // ======================= 参考源码1 彩色注入状态 =======================
 static CGRect gLastFaceRect;                     // 零初始化 == CGRectZero
 static uint64_t gLastFaceTime = 0;
@@ -999,20 +999,34 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
 }
 
 // ======================= 彩色注入（完全照搬参考源码1 逻辑）=======================
+// 与原版唯一差异：强度 alpha 从 plist `injectAlpha` 读取（UI 滑块写入），不再硬编码 0.35
+// 其余算法（Vision 检测、3 帧节流、500ms 超时、faceContour mask、CIBlendWithMask、
+// 参数 diameter=0.50 / offX=0 / offY=0 / mode=0）完全与参考源码1一致
 - (void)injectVesselFlow:(CVPixelBufferRef)buf {
     if (!buf) return;
 
-    // 从 plist 取色
-    CGFloat gInjectR = 0, gInjectG = 0, gInjectB = 0;
-    vessel_resolveColor(&gInjectR, &gInjectG, &gInjectB);
-    if (gInjectR < 0.01 && gInjectG < 0.01 && gInjectB < 0.01) return;
+    // 从 plist 取色（vessel_resolveColor 内部已处理 lightEnabled/lightColor 与 fallback）
+    CGFloat injR = 0, injG = 0, injB = 0;
+    vessel_resolveColor(&injR, &injG, &injB);
+    if (injR < 0.01 && injG < 0.01 && injB < 0.01) return;
 
-    // 参考源码1 参数默认值
-    CGFloat gInjectAlpha = 0.35;
-    CGFloat gInjectDiameter = 0.50;
-    CGFloat gInjectOffX = 0.0;
-    CGFloat gInjectOffY = 0.0;
-    int gInjectMode = 0;
+    // 从 plist 取强度（UI 滑块写入 injectAlpha，范围 0.05~1.0，缺省 0.35）
+    CGFloat injAlpha = 0.35;
+    @try {
+        NSDictionary *plA = plRead();
+        id aObj = plA[@"injectAlpha"];
+        if (aObj) {
+            injAlpha = [aObj doubleValue];
+            if (injAlpha < 0.05) injAlpha = 0.05;
+            if (injAlpha > 1.0)  injAlpha = 1.0;
+        }
+    } @catch (NSException *e) {}
+
+    // 参考源码1 参数默认值（不开放给 UI，保持与参考完全一致）
+    CGFloat injDiameter = 0.50;
+    CGFloat injOffX = 0.0;
+    CGFloat injOffY = 0.0;
+    int injMode = 0;
 
     static CIContext *sCtx = nil;
     if (!sCtx) sCtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
@@ -1046,15 +1060,15 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
                 CGFloat imgW = ext.size.width, imgH = ext.size.height;
                 CGFloat bx = bbox.origin.x * imgW, by = bbox.origin.y * imgH;
                 CGFloat bw = bbox.size.width * imgW, bh = bbox.size.height * imgH;
-                CGFloat cx = bx + bw * 0.5 + gInjectOffX * bw;
-                CGFloat cy = by + bh * 0.5 + gInjectOffY * bh;
-                CGFloat nw = bw * gInjectDiameter * 2, nh = bh * gInjectDiameter * 2;
+                CGFloat cx = bx + bw * 0.5 + injOffX * bw;
+                CGFloat cy = by + bh * 0.5 + injOffY * bh;
+                CGFloat nw = bw * injDiameter * 2, nh = bh * injDiameter * 2;
                 faceRect = CGRectMake(cx - nw * 0.5, cy - nh * 0.5, nw, nh);
                 faceRect = CGRectIntersection(faceRect, ext);
                 gLastFaceRect = faceRect;
                 gLastFaceTime = mach_absolute_time();
 
-                if (gInjectMode == 0 && sLastObs.landmarks.faceContour) {
+                if (injMode == 0 && sLastObs.landmarks.faceContour) {
                     VNFaceLandmarkRegion2D *contour = sLastObs.landmarks.faceContour;
                     const CGPoint *pts = [contour pointsInImageOfSize:ext.size];
                     if (pts && contour.pointCount > 2) {
@@ -1062,8 +1076,8 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
                         CGFloat bcx = (bbox.origin.x + bbox.size.width * 0.5) * imgW;
                         CGFloat bcy = (bbox.origin.y + bbox.size.height * 0.5) * imgH;
                         for (NSUInteger i = 0; i < contour.pointCount; i++) {
-                            CGFloat px = bcx + (pts[i].x - bcx) * gInjectDiameter * 2 + gInjectOffX * bw;
-                            CGFloat py = bcy + (pts[i].y - bcy) * gInjectDiameter * 2 + gInjectOffY * bh;
+                            CGFloat px = bcx + (pts[i].x - bcx) * injDiameter * 2 + injOffX * bw;
+                            CGFloat py = bcy + (pts[i].y - bcy) * injDiameter * 2 + injOffY * bh;
                             if (i == 0) CGPathMoveToPoint(path, NULL, px, py);
                             else CGPathAddLineToPoint(path, NULL, px, py);
                         }
@@ -1094,7 +1108,7 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
 
     // 构建 mask
     CIImage *mask = nil;
-    if (gInjectMode == 0 && gLastFaceContourPath) {
+    if (injMode == 0 && gLastFaceContourPath) {
         mask = vcam_createContourMask(gLastFaceContourPath, ext);
     }
     if (!mask) {
@@ -1110,8 +1124,8 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
     }
     if (!mask) return;
 
-    // 颜色覆盖层
-    CIColor *overlayColor = [CIColor colorWithRed:gInjectR green:gInjectG blue:gInjectB alpha:gInjectAlpha];
+    // 颜色覆盖层（强度从 plist 读到的 injAlpha）
+    CIColor *overlayColor = [CIColor colorWithRed:injR green:injG blue:injB alpha:injAlpha];
     CIImage *colorImg = [[CIImage imageWithColor:overlayColor] imageByCroppingToRect:ext];
 
     // CIBlendWithMask 混合
@@ -1587,16 +1601,26 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     return b;
 }
 
+// ============================================================
+// 控制面板 VCBall（单页控制 + 底部彩色注入行）
+// 改造点：
+//   1) 删除"血管"tab 及其吸色/人脸/心率状态显示（废弃）
+//   2) 控制页底部追加：彩色强度滑块（增强/减少合并） + 彩虹注入按钮 + 2 个预留位
+//   3) 算法与采集逻辑（sampleScreenColor 等）完全保留，不动
+//   4) 彩色强度改为写 plist injectAlpha，供 mediaserverd 的 injectVesselFlow 读取
+// ============================================================
 @interface VCBall : NSObject <PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) VCBallView *ball;
 @property (nonatomic, strong) UIView *panel;
-@property (nonatomic, strong) UIView *ctrlPage, *vesselPage;
-@property (nonatomic, strong) UIButton *tabCtrlBtn, *tabVesselBtn;
-@property (nonatomic, strong) UIButton *replaceBtn, *playBtn, *mirrorBtn, *vesselBtn;
+@property (nonatomic, strong) UIView *ctrlPage;
+@property (nonatomic, strong) UIButton *replaceBtn, *playBtn, *mirrorBtn;
+@property (nonatomic, strong) UIButton *vesselBtn;        // 彩虹"注入"按钮（保留原属性名）
+@property (nonatomic, strong) UISlider *colorSlider;      // 彩色强度滑块
+@property (nonatomic, strong) UILabel *colorValueLabel;   // 滑块百分比显示
 @property (nonatomic, strong) UIView *colorIndicator;
 @property (nonatomic, strong) NSTimer *colorSampleTimer;
-@property (nonatomic, assign) BOOL visible, floating, paused, vesselPageActive;
+@property (nonatomic, assign) BOOL visible, floating, paused;
 @property (nonatomic, assign) int buildRetries;
 + (instancetype)shared;
 - (void)show;
@@ -1605,10 +1629,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)_build;
 - (void)buildPanel;
 - (void)buildCtrlPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH;
-- (void)buildVesselPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH;
 - (void)refreshVisuals;
-- (void)refreshTabStyles;
-- (void)refreshVesselStatus;
 - (void)layoutPanel;
 - (void)toast:(NSString *)msg;
 - (void)pickMedia;
@@ -1626,18 +1647,19 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)resetTransform;
 - (void)toggleMirror;
 - (void)toggleVesselFlow;
+- (void)colorIntensityChanged:(UISlider *)s;
 - (void)startColorSampling;
 - (void)stopColorSampling;
 - (void)sampleScreenColor;
 - (void)ballTap;
 - (void)ballDrag:(UIPanGestureRecognizer *)g;
-- (void)switchCtrlTab;
-- (void)switchVesselTab;
 - (void)didActive;
 - (void)loadVideoProvider:(NSItemProvider *)p;
 - (void)loadImageProvider:(NSItemProvider *)p;
 - (BOOL)isVideoProvider:(NSItemProvider *)p;
 - (BOOL)isImageProvider:(NSItemProvider *)p;
+- (UIButton *)makeRainbowBtn:(CGRect)frame;
+- (UIView *)makeReserveSlot:(CGRect)frame;
 @end
 
 @implementation VCBall
@@ -1659,7 +1681,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         [self.win removeFromSuperview];
         self.win.hidden = YES;
         self.win = nil; self.ball = nil; self.panel = nil;
-        self.ctrlPage = nil; self.vesselPage = nil;
+        self.ctrlPage = nil;
     });
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
@@ -1745,20 +1767,15 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(pad, 38, pw - pad * 2, 1)];
     sep.backgroundColor = CBtnBorder();
     [_panel addSubview:sep];
-    CGFloat tabY = 46, tabH = 26, contentW = pw - pad * 2;
-    CGFloat tabW = (contentW - 6) / 2;
-    _tabCtrlBtn = makeRetroBtn(@"控制", CGRectMake(pad, tabY, tabW, tabH), self, @selector(switchCtrlTab));
-    _tabVesselBtn = makeRetroBtn(@"血管", CGRectMake(pad + tabW + 6, tabY, tabW, tabH), self, @selector(switchVesselTab));
-    [_panel addSubview:_tabCtrlBtn]; [_panel addSubview:_tabVesselBtn];
-    CGFloat pageY = tabY + tabH + 6;
+
+    // 单页控制：去除原双 tab，pageY 直接从分隔线下方开始
+    CGFloat pageY = 46;
+    CGFloat contentW = pw - pad * 2;
     CGFloat pageH = ph - pageY - pad;
     _ctrlPage = [[UIView alloc] initWithFrame:CGRectMake(0, pageY, pw, pageH)];
     [self buildCtrlPage:_ctrlPage width:pw pad:pad contentW:contentW pageH:pageH];
     [_panel addSubview:_ctrlPage];
-    _vesselPage = [[UIView alloc] initWithFrame:CGRectMake(0, pageY, pw, pageH)];
-    [self buildVesselPage:_vesselPage width:pw pad:pad contentW:contentW pageH:pageH];
-    _vesselPage.hidden = YES;
-    [_panel addSubview:_vesselPage];
+
     [self refreshVisuals];
     [_win addSubview:_panel];
 }
@@ -1768,13 +1785,16 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     CGFloat dpadTotal = smallW + dg + cell + dg + cell + dg + cell + dg + smallW;
     CGFloat dpadStartX = pad + (contentW - dpadTotal) / 2.0;
 
+    // 1) 选择视频/图片
     [page addSubview:makeRetroBtn(@"选择 视频/图片", CGRectMake(pad, y, contentW, btnH), self, @selector(pickMedia))];
     y += btnH + gap;
 
+    // 2) 替换开关
     _replaceBtn = makeRetroBtn(@"替 换 · ON", CGRectMake(pad, y, contentW, btnH), self, @selector(toggleReplace));
     [page addSubview:_replaceBtn];
     y += btnH + gap;
 
+    // 3) 旋转/镜像/暂停
     CGFloat threeGap = dg;
     CGFloat threeW = (dpadTotal - threeGap * 2) / 3.0;
     [page addSubview:makeIconBtn(@"arrow.clockwise", CGRectMake(dpadStartX, y, threeW, btnH), self, @selector(rotate))];
@@ -1784,6 +1804,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [page addSubview:_playBtn];
     y += btnH + gap;
 
+    // 4) D-pad + 缩放
     CGFloat xMinus = dpadStartX, xLeft = dpadStartX + smallW + dg;
     CGFloat xMid = xLeft + cell + dg, xRight = xMid + cell + dg, xPlus = xRight + cell + dg;
     CGFloat topY = y, midY = y + cell + dg, botY = y + (cell + dg) * 2;
@@ -1799,60 +1820,178 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     up.tintColor = CGlow(); dn.tintColor = CGlow();
     [page addSubview:up]; [page addSubview:dn]; [page addSubview:lf]; [page addSubview:rt]; [page addSubview:rs]; [page addSubview:minus]; [page addSubview:plus];
     y += cell * 3 + dg * 2 + gap;
-}
-- (void)buildVesselPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
-    CGFloat y = 8;
 
-    _vesselBtn = makeRetroBtn(@"🩸 仿生血管流动 · OFF", CGRectMake(pad, y, contentW, 40), self, @selector(toggleVesselFlow));
+    // 5) 分隔线
+    UIView *divider = [[UIView alloc] initWithFrame:CGRectMake(pad, y, contentW, 1)];
+    divider.backgroundColor = CBtnBorder();
+    [page addSubview:divider];
+    y += 1 + gap;
+
+    // 6) 彩色强度滑块（增强/减少合并）
+    UILabel *sliderLabel = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, 56, btnH)];
+    sliderLabel.text = @"彩色强度";
+    sliderLabel.textColor = CTextMain();
+    sliderLabel.font = [UIFont boldSystemFontOfSize:11];
+    [page addSubview:sliderLabel];
+
+    CGFloat sliderX = pad + 60;
+    CGFloat sliderW = contentW - 60 - 44;
+    _colorSlider = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, y, sliderW, btnH)];
+    _colorSlider.minimumValue = 0.05;
+    _colorSlider.maximumValue = 1.0;
+    _colorSlider.value = 0.35;
+    _colorSlider.minimumTrackTintColor = CGlow();
+    _colorSlider.maximumTrackTintColor = CBtnBg();
+    [_colorSlider addTarget:self action:@selector(colorIntensityChanged:) forControlEvents:UIControlEventValueChanged];
+    [page addSubview:_colorSlider];
+
+    _colorValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - 42, y, 42, btnH)];
+    _colorValueLabel.text = @"35%";
+    _colorValueLabel.textColor = CGlow();
+    _colorValueLabel.font = [UIFont boldSystemFontOfSize:12];
+    _colorValueLabel.textAlignment = NSTextAlignmentRight;
+    [page addSubview:_colorValueLabel];
+    y += btnH + gap;
+
+    // 7) 彩虹注入按钮 + 2 个预留位（后续接新按键）
+    CGFloat rbW = contentW * 0.5;
+    CGFloat rbH = 32;
+    _vesselBtn = [self makeRainbowBtn:CGRectMake(pad, y, rbW, rbH)];
     [page addSubview:_vesselBtn];
-    y += 48;
 
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(pad, y, contentW, 52)];
-    card.backgroundColor = [CBtnBg() colorWithAlphaComponent:0.4];
-    card.layer.cornerRadius = 8;
-    [page addSubview:card];
-
-    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, contentW - 16, 14)];
-    l1.text = @"● 吸色 —"; l1.font = [UIFont systemFontOfSize:11]; l1.textColor = CTextMain();
-    l1.tag = 9001;
-    [card addSubview:l1];
-
-    UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(8, 22, contentW - 16, 14)];
-    l2.text = @"● 人脸 —"; l2.font = [UIFont systemFontOfSize:11]; l2.textColor = CTextMain();
-    l2.tag = 9002;
-    [card addSubview:l2];
-
-    UILabel *l3 = [[UILabel alloc] initWithFrame:CGRectMake(8, 36, contentW - 16, 14)];
-    l3.text = @"♥ 心率 68 bpm（自动）"; l3.font = [UIFont systemFontOfSize:11]; l3.textColor = CTextMain();
-    l3.tag = 9003;
-    [card addSubview:l3];
-
-    __weak typeof(self) w = self;
-    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-        [w refreshVesselStatus];
-    }];
+    CGFloat reserveW = contentW * 0.25 - 6;
+    CGFloat r1x = pad + rbW + 6;
+    CGFloat r2x = r1x + reserveW + 6;
+    UIView *r1 = [self makeReserveSlot:CGRectMake(r1x, y, reserveW, rbH)];
+    UIView *r2 = [self makeReserveSlot:CGRectMake(r2x, y, reserveW, rbH)];
+    [page addSubview:r1];
+    [page addSubview:r2];
 }
+- (UIButton *)makeRainbowBtn:(CGRect)frame {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = frame;
+    CAGradientLayer *g = [CAGradientLayer layer];
+    g.frame = CGRectMake(0, 0, frame.size.width, frame.size.height);
+    g.colors = @[
+        (id)[UIColor colorWithRed:1.00 green:0.00 blue:0.00 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:1.00 green:0.50 blue:0.00 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:1.00 green:1.00 blue:0.00 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:0.00 green:0.85 blue:0.20 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:0.00 green:0.80 blue:1.00 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:0.15 green:0.25 blue:1.00 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:0.60 green:0.00 blue:0.90 alpha:1.0].CGColor,
+    ];
+    g.locations = @[@0.0, @0.166, @0.333, @0.5, @0.666, @0.833, @1.0];
+    g.startPoint = CGPointMake(0, 0.5);
+    g.endPoint = CGPointMake(1, 0.5);
+    g.cornerRadius = 10;
+    [b.layer insertSublayer:g atIndex:0];
+    b.layer.cornerRadius = 10;
+    b.layer.masksToBounds = YES;
+    b.layer.borderWidth = 1;
+    b.layer.borderColor = [UIColor whiteColor].CGColor;
 
-- (void)switchCtrlTab {
-    _vesselPageActive = NO;
-    _ctrlPage.hidden = NO;
-    _vesselPage.hidden = YES;
-    [self refreshTabStyles];
-}
-- (void)switchVesselTab {
-    _vesselPageActive = YES;
-    _ctrlPage.hidden = YES;
-    _vesselPage.hidden = NO;
-    [self refreshTabStyles];
-}
-- (void)refreshTabStyles {
-    UIColor *activeBg = CGlow(), *inactiveBg = CBtnBg(), *activeFg = CDeep(), *inactiveFg = CTextMain();
-    [_tabCtrlBtn setTitleColor:(_vesselPageActive ? inactiveFg : activeFg) forState:UIControlStateNormal];
-    [_tabCtrlBtn setBackgroundColor:(_vesselPageActive ? inactiveBg : activeBg)];
-    [_tabVesselBtn setTitleColor:(_vesselPageActive ? activeFg : inactiveFg) forState:UIControlStateNormal];
-    [_tabVesselBtn setBackgroundColor:(_vesselPageActive ? activeBg : inactiveBg)];
-}
+    UIView *tint = [[UIView alloc] initWithFrame:b.bounds];
+    tint.backgroundColor = [UIColor colorWithWhite:0 alpha:0.28];
+    tint.userInteractionEnabled = NO;
+    [b addSubview:tint];
 
+    [b setTitle:@"🌈 注入 · OFF" forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    b.titleLabel.layer.shadowColor = [UIColor blackColor].CGColor;
+    b.titleLabel.layer.shadowRadius = 3;
+    b.titleLabel.layer.shadowOpacity = 0.9;
+    b.titleLabel.layer.shadowOffset = CGSizeZero;
+
+    [b addTarget:self action:@selector(toggleVesselFlow) forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+- (UIView *)makeReserveSlot:(CGRect)frame {
+    UIView *v = [[UIView alloc] initWithFrame:frame];
+    v.backgroundColor = [CBtnBg() colorWithAlphaComponent:0.15];
+    v.layer.cornerRadius = 10;
+    v.layer.borderWidth = 1;
+    v.layer.borderColor = [CBtnBorder() colorWithAlphaComponent:0.3].CGColor;
+    UILabel *l = [[UILabel alloc] initWithFrame:v.bounds];
+    l.text = @"+";
+    l.textColor = [CTextMain() colorWithAlphaComponent:0.3];
+    l.textAlignment = NSTextAlignmentCenter;
+    l.font = [UIFont systemFontOfSize:16];
+    l.userInteractionEnabled = NO;
+    [v addSubview:l];
+    return v;
+}
+- (void)layoutPanel {
+    CGFloat pw = _panel.frame.size.width, ph = _panel.frame.size.height, gap = 8;
+    CGFloat rx = CGRectGetMaxX(_ball.frame) + gap;
+    CGFloat lx = _ball.frame.origin.x - pw - gap;
+    CGFloat px = (rx + pw <= _win.frame.size.width - 5) ? rx : lx;
+    px = MAX(5, px);
+    CGFloat py = _ball.center.y - ph / 2;
+    py = MAX(5, MIN(_win.frame.size.height - ph - 5, py));
+    _panel.frame = CGRectMake(px, py, pw, ph);
+}
+- (void)ballTap {
+    _visible = !_visible;
+    if (_visible) { [self layoutPanel]; _panel.hidden = NO; [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 1; }]; }
+    else { [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 0; } completion:^(BOOL f){ _panel.hidden = YES; }]; }
+}
+- (void)ballDrag:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:_win];
+    CGPoint c = CGPointMake(_ball.center.x + t.x, _ball.center.y + t.y);
+    CGFloat h = _ball.frame.size.width / 2;
+    c.x = MAX(h, MIN(_win.frame.size.width - h, c.x)); c.y = MAX(h, MIN(_win.frame.size.height - h, c.y));
+    _ball.center = c; [g setTranslation:CGPointZero inView:_win]; [self layoutPanel];
+}
+- (void)refreshVisuals {
+    NSDictionary *pl = plRead();
+    BOOL en = [pl[@"enabled"] boolValue];
+    [_replaceBtn setTitle:(en ? @"替 换 · ON" : @"还 原 · OFF") forState:UIControlStateNormal];
+    _replaceBtn.backgroundColor = en ? CGlow() : CBtnBg();
+    [_replaceBtn setTitleColor:(en ? CDeep() : CTextMain()) forState:UIControlStateNormal];
+    _replaceBtn.layer.borderColor = en ? CDeep().CGColor : CBtnBorder().CGColor;
+    BOOL mi = [pl[@"mirrored"] boolValue];
+    _mirrorBtn.backgroundColor = mi ? CBtnBorder() : CBtnBg();
+    _mirrorBtn.tintColor = mi ? CGlow() : CTextMain();
+
+    // 彩虹注入按钮状态
+    BOOL vesselOn = [pl[@"vesselFlowEnabled"] boolValue];
+    if (_vesselBtn) {
+        [_vesselBtn setTitle:(vesselOn ? @"🌈 注入 · ON" : @"🌈 注入 · OFF") forState:UIControlStateNormal];
+        _vesselBtn.alpha = vesselOn ? 1.0 : 0.55;
+    }
+    // 强度滑块同步 plist（跨进程给 injectVesselFlow 用）
+    if (_colorSlider) {
+        double a = [pl[@"injectAlpha"] doubleValue];
+        if (a < 0.05 || a > 1.0) a = 0.35;
+        _colorSlider.value = a;
+        _colorValueLabel.text = [NSString stringWithFormat:@"%d%%", (int)(a * 100)];
+    }
+    // 彩点
+    if (_colorIndicator) {
+        BOOL lightOn = [pl[@"lightEnabled"] boolValue];
+        uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
+        _colorIndicator.hidden = !(vesselOn && lightOn && c != 0);
+        if (vesselOn && lightOn && c != 0) {
+            CGFloat r = ((c >> 16) & 0xFF) / 255.0;
+            CGFloat gg = ((c >>  8) & 0xFF) / 255.0;
+            CGFloat bb = ( c        & 0xFF) / 255.0;
+            _colorIndicator.backgroundColor = [UIColor colorWithRed:r green:gg blue:bb alpha:1.0];
+        }
+    }
+    _paused = [pl[@"paused"] boolValue];
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightBold];
+    [_playBtn setImage:[UIImage systemImageNamed:(_paused ? @"play.fill" : @"pause.fill") withConfiguration:cfg] forState:UIControlStateNormal];
+}
+- (void)colorIntensityChanged:(UISlider *)s {
+    double v = s.value;
+    if (v < 0.05) v = 0.05;
+    if (v > 1.0) v = 1.0;
+    _colorValueLabel.text = [NSString stringWithFormat:@"%d%%", (int)(v * 100)];
+    plSet(@"injectAlpha", @(v));
+    vcamBallLog([NSString stringWithFormat:@"[vcam] injectAlpha=%.2f", v]);
+}
 - (void)toggleVesselFlow {
     BOOL cur = [plRead()[@"vesselFlowEnabled"] boolValue];
     BOOL next = !cur;
@@ -1865,59 +2004,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     if (next) [self startColorSampling];
     else [self stopColorSampling];
     [self refreshVisuals];
-    [self toast:(next ? @"血管流动开" : @"血管流动关")];
+    [self toast:(next ? @"彩色注入开" : @"彩色注入关")];
 }
-
-- (void)refreshVesselStatus {
-    NSDictionary *pl = plRead();
-    BOOL on = [pl[@"vesselFlowEnabled"] boolValue];
-
-    if (on && !_colorSampleTimer) {
-        [self startColorSampling];
-        vcamLog(@"[vcam] auto-start color sampling (vessel ON)");
-    } else if (!on && _colorSampleTimer) {
-        [self stopColorSampling];
-        vcamLog(@"[vcam] auto-stop color sampling (vessel OFF)");
-    }
-
-    if (_colorIndicator) {
-        _colorIndicator.hidden = !on;
-        uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-        if (on && c != 0) {
-            CGFloat r = ((c >> 16) & 0xFF) / 255.0;
-            CGFloat g = ((c >>  8) & 0xFF) / 255.0;
-            CGFloat b = ( c        & 0xFF) / 255.0;
-            _colorIndicator.backgroundColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
-        } else if (on) {
-            _colorIndicator.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
-        }
-    }
-
-    if (!_vesselPage || _vesselPage.hidden) return;
-
-    BOOL lightOn = [pl[@"lightEnabled"] boolValue];
-    uint32_t c = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-    UILabel *l1 = [_vesselPage viewWithTag:9001];
-    UILabel *l2 = [_vesselPage viewWithTag:9002];
-    UILabel *l3 = [_vesselPage viewWithTag:9003];
-    if (!l1) return;
-
-    UIColor *dotC = [UIColor systemGrayColor];
-    NSString *s1 = @"● 吸色 关闭";
-    if (on && lightOn && c != 0) { dotC = [UIColor systemGreenColor]; s1 = @"● 吸色 正常"; }
-    else if (on && lightOn)     { dotC = [UIColor systemOrangeColor]; s1 = @"● 吸色 失败"; }
-    l1.text = s1;
-    l1.textColor = dotC;
-
-    BOOL faceLocked = [pl[@"vesselFaceLocked"] boolValue];
-    l2.text = faceLocked ? @"● 人脸 已锁定" : @"● 人脸 未检测";
-    l2.textColor = faceLocked ? [UIColor systemGreenColor] : [UIColor systemGrayColor];
-
-    CGFloat curBpm = vessel_autoBpm();
-    l3.text = [NSString stringWithFormat:@"♥ 心率 %d bpm（自动）", (int)curBpm];
-    l3.textColor = CTextMain();
-}
-
 - (void)startColorSampling {
     [_colorSampleTimer invalidate];
     __weak typeof(self) w = self;
@@ -2010,9 +2098,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
             if (sLastValidTime > 0 && CFAbsoluteTimeGetCurrent() - sLastValidTime > 2.0) {
                 plSetMany(@{@"lightColor":@(0), @"lightEnabled":@NO});
                 sLastValidTime = 0;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    _colorIndicator.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
-                });
             }
         }
     } @catch (NSException *e) {
@@ -2020,49 +2105,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     }
 }
 
-- (void)ballTap {
-    _visible = !_visible;
-    if (_visible) { [self layoutPanel]; _panel.hidden = NO; [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 1; }]; }
-    else { [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 0; } completion:^(BOOL f){ _panel.hidden = YES; }]; }
-}
-- (void)ballDrag:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:_win];
-    CGPoint c = CGPointMake(_ball.center.x + t.x, _ball.center.y + t.y);
-    CGFloat h = _ball.frame.size.width / 2;
-    c.x = MAX(h, MIN(_win.frame.size.width - h, c.x)); c.y = MAX(h, MIN(_win.frame.size.height - h, c.y));
-    _ball.center = c; [g setTranslation:CGPointZero inView:_win]; [self layoutPanel];
-}
-- (void)layoutPanel {
-    CGFloat pw = _panel.frame.size.width, ph = _panel.frame.size.height, gap = 8;
-    CGFloat rx = CGRectGetMaxX(_ball.frame) + gap;
-    CGFloat lx = _ball.frame.origin.x - pw - gap;
-    CGFloat px = (rx + pw <= _win.frame.size.width - 5) ? rx : lx;
-    px = MAX(5, px);
-    CGFloat py = _ball.center.y - ph / 2;
-    py = MAX(5, MIN(_win.frame.size.height - ph - 5, py));
-    _panel.frame = CGRectMake(px, py, pw, ph);
-}
-- (void)refreshVisuals {
-    NSDictionary *pl = plRead();
-    BOOL en = [pl[@"enabled"] boolValue];
-    [_replaceBtn setTitle:(en ? @"替 换 · ON" : @"还 原 · OFF") forState:UIControlStateNormal];
-    _replaceBtn.backgroundColor = en ? CGlow() : CBtnBg();
-    [_replaceBtn setTitleColor:(en ? CDeep() : CTextMain()) forState:UIControlStateNormal];
-    _replaceBtn.layer.borderColor = en ? CDeep().CGColor : CBtnBorder().CGColor;
-    BOOL mi = [pl[@"mirrored"] boolValue];
-    _mirrorBtn.backgroundColor = mi ? CBtnBorder() : CBtnBg();
-    _mirrorBtn.tintColor = mi ? CGlow() : CTextMain();
-    BOOL vesselOn = [pl[@"vesselFlowEnabled"] boolValue];
-    if (_vesselBtn) {
-        [_vesselBtn setTitle:(vesselOn ? @"🩸 仿生血管流动 · ON" : @"🩸 仿生血管流动 · OFF") forState:UIControlStateNormal];
-        _vesselBtn.backgroundColor = vesselOn ? CGlow() : CBtnBg();
-        [_vesselBtn setTitleColor:(vesselOn ? CDeep() : CTextMain()) forState:UIControlStateNormal];
-        _vesselBtn.layer.borderColor = vesselOn ? CDeep().CGColor : CBtnBorder().CGColor;
-    }
-    _paused = [pl[@"paused"] boolValue];
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightBold];
-    [_playBtn setImage:[UIImage systemImageNamed:(_paused ? @"play.fill" : @"pause.fill") withConfiguration:cfg] forState:UIControlStateNormal];
-}
+// ===== 媒体选择 / 变换 / 缩放 / 镜像 等原逻辑，完全保留 =====
 - (void)pickMedia {
     dispatch_async(dispatch_get_main_queue(), ^{
         PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
