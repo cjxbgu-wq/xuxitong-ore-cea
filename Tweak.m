@@ -1002,11 +1002,11 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
         }
     } @catch (NSException *e) {}
 
-    // 参考源码1 参数默认值（不开放给 UI，保持与参考完全一致）
+        // 参考源码1 参数默认值（不开放给 UI，保持与参考完全一致）
     CGFloat injDiameter = 0.50;
     CGFloat injOffX = 0.0;
     CGFloat injOffY = 0.0;
-    int injMode = 0;
+    int injMode = 1; // 强制改为 1（椭圆），避免帽子遮挡导致轮廓缺失、出块状
 
     static CIContext *sCtx = nil;
     if (!sCtx) sCtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
@@ -1048,10 +1048,10 @@ static CIImage *vcam_createContourMask(CGPathRef contourPath, CGRect extent) {
                 gLastFaceRect = faceRect;
                 gLastFaceTime = mach_absolute_time();
 
-                if (injMode == 0 && sLastObs.landmarks.faceContour) {
+                              if (injMode == 0 && sLastObs.landmarks.faceContour) {
                     VNFaceLandmarkRegion2D *contour = sLastObs.landmarks.faceContour;
                     const CGPoint *pts = [contour pointsInImageOfSize:ext.size];
-                    if (pts && contour.pointCount > 2) {
+                    if (pts && contour.pointCount > 30) { // 提高到 30，防止半截脸
                         CGMutablePathRef path = CGPathCreateMutable();
                         CGFloat bcx = (bbox.origin.x + bbox.size.width * 0.5) * imgW;
                         CGFloat bcy = (bbox.origin.y + bbox.size.height * 0.5) * imgH;
@@ -2021,11 +2021,18 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         }
         if (!snapshot) return;
         CGImageRef cgImg = snapshot.CGImage; if (!cgImg) return;
-        size_t w = CGImageGetWidth(cgImg), h = CGImageGetHeight(cgImg);
-        size_t edgeW = w*15/100, edgeH = h*15/100;
+              size_t w = CGImageGetWidth(cgImg), h = CGImageGetHeight(cgImg);
+        // 避开顶部的状态栏和底部的按钮区域，只在屏幕中间的环境区域采样
+        size_t safeTop = h * 25 / 100;       // 避开顶部 25%
+        size_t safeBottom = h * 20 / 100;    // 避开底部 20%
+        size_t safeH = h - safeTop - safeBottom;
+        size_t edgeW = w * 15 / 100;
+        
         CGRect rects[4] = {
-            CGRectMake(0,0,w,edgeH), CGRectMake(0,h-edgeH,w,edgeH),
-            CGRectMake(0,edgeH,edgeW,h-2*edgeH), CGRectMake(w-edgeW,edgeH,edgeW,h-2*edgeH),
+            CGRectMake(0, safeTop, w, safeH/4),                  // 中间区域靠上
+            CGRectMake(0, h - safeBottom - safeH/4, w, safeH/4), // 中间区域靠下
+            CGRectMake(0, safeTop + safeH/4, edgeW, safeH/2),    // 中间区域靠左
+            CGRectMake(w - edgeW, safeTop + safeH/4, edgeW, safeH/2) // 中间区域靠右
         };
         CGFloat tR=0,tG=0,tB=0,tW=0, bSat=0,bR=0,bG=0,bB=0;
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
