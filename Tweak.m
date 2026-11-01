@@ -98,27 +98,7 @@ static void plSetMany(NSDictionary *kv) {
     [d writeToFile:kPlist atomically:YES];
 }
 
-// ======================= 心率计算（仅 UI 显示用，不参与注入）=======================
-static CGFloat gVesselBpm = 68.0;
-static CGFloat gVesselBpmTarget = 68.0;
-static CGFloat gVesselPhase = 0.0;
-static CFAbsoluteTime gVesselLastShift = 0.0;
-static CFAbsoluteTime gVesselLastTime = 0.0;
 
-static CGFloat vessel_autoBpm(void) {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (gVesselLastShift == 0.0 || now >= gVesselLastShift) {
-        gVesselBpmTarget = 68.0 + ((CGFloat)(arc4random_uniform(1200)) / 100.0 - 6.0);
-        gVesselLastShift = now + 5.0 + (CGFloat)(arc4random_uniform(500)) / 100.0;
-    }
-    gVesselBpm += (gVesselBpmTarget - gVesselBpm) * 0.02;
-    if (gVesselLastTime == 0.0) gVesselLastTime = now;
-    CGFloat dt = now - gVesselLastTime;
-    gVesselLastTime = now;
-    gVesselPhase += 2.0 * M_PI * (gVesselBpm / 60.0) * dt;
-    if (gVesselPhase > 1000.0) gVesselPhase -= 1000.0;
-    return gVesselBpm;
-}
 
 // ======================= 颜色解析（从 plist 取色）=======================
 static void vessel_resolveColor(CGFloat *r, CGFloat *g, CGFloat *b) {
