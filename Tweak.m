@@ -1,10 +1,10 @@
 //
 //  Tweak.m
-//  VCamPlus · 完整修复版（上）
+//  VCamPlus · 002 对齐完整版（压缩 · 上）
 //  视频替换：三车道 + 三级回退 + 熔断（照搬源码1）
 //  填充：边界延伸（无重叠、无黑边）
 //  卡顿：process 结果缓存
-//  彩色注入整段未动
+//  彩色注入：Vision 人脸跟随 + CIBlendWithMask（对齐 002）
 //
 
 #import <Foundation/Foundation.h>
@@ -21,6 +21,10 @@
 #import <math.h>
 #import <string.h>
 #import <mach-o/dyld.h>
+// ===== [MOD-0] 新增 CoreImage / Vision（对齐 002） =====
+#import <CoreImage/CoreImage.h>
+#import <Vision/Vision.h>
+// ===== [MOD-0] end =====
 
 // ======================= 日志 =======================
 static BOOL vcamLogOn(void) {
@@ -648,7 +652,14 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @property (nonatomic, assign) double panX, panY, zoom;
 @property (nonatomic, assign) BOOL lightOn;
 @property (nonatomic, assign) uint32_t lightColor;
-@property (nonatomic, assign) int lightX, lightY, lightInt, lightDia, lightFea;
+// ===== [MOD-1] 属性块替换: lightX/Y/Dia/Fea → lightInt + CI 相关 =====
+@property (nonatomic, assign) int lightInt;
+@property (nonatomic, strong) CIContext *ciContext;
+@property (nonatomic, assign) CGRect lastFaceRect;
+@property (nonatomic, assign) int faceDetectSkip;
+@property (nonatomic, assign) CGPathRef lastFaceContourPath;
+@property (nonatomic, assign) uint64_t lastFaceTime;
+// ===== [MOD-1] end =====
 @property (nonatomic, assign) CVPixelBufferRef pieceA, pieceB;
 @property (nonatomic, assign) size_t pieceAW, pieceAH, pieceBW, pieceBH;
 @property (nonatomic, assign) OSType pieceFmt;
@@ -673,6 +684,10 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 - (BOOL)transfer:(CVPixelBufferRef)s to:(CVPixelBufferRef)d;
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED;
 - (CVPixelBufferRef)_process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED;
+// ===== [MOD-5] 新增方法声明 =====
+- (CIImage *)applyColorInjectToImage:(CIImage *)img;
+- (CIImage *)createContourMaskImage:(CGPathRef)path extent:(CGRect)ext;
+// ===== [MOD-5] end =====
 @end
 
 @implementation VCProc
@@ -708,6 +723,9 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         _laneDisabled = [NSMutableDictionary dictionary];
         _s1Session = NULL;
         _cacheHitCount = 0;
+        // ===== [MOD-2] 新增 CIContext =====
+        _ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+        // ===== [MOD-2] end =====
     }
     return self;
 }
@@ -724,6 +742,9 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     if (_normal) VTPixelTransferSessionInvalidate(_normal);
     if (_s1Session) VTPixelTransferSessionInvalidate(_s1Session);
     if (_rot && _rotInv) _rotInv(_rot);
+    // ===== [MOD-3] 释放路径缓存 =====
+    if (_lastFaceContourPath) { CGPathRelease(_lastFaceContourPath); _lastFaceContourPath = NULL; }
+    // ===== [MOD-3] end =====
 }
 - (VTPixelTransferSessionRef)normalSession {
     if (_normal) return _normal;
@@ -937,104 +958,125 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     }
     return canvas;
 }
-- (void)injectLight:(CVPixelBufferRef)buf {
-    if (!buf || !_lightOn || _lightColor == 0) return;
-    size_t W = CVPixelBufferGetWidth(buf), H = CVPixelBufferGetHeight(buf);
-    if (W < 16 || H < 16 || CVPixelBufferGetPlaneCount(buf) != 2) return;
-    if ((W & 1) || (H & 1)) return;
-    uint8_t r = (_lightColor >> 16) & 0xFF;
-    uint8_t g = (_lightColor >> 8) & 0xFF;
-    uint8_t b = _lightColor & 0xFF;
-    uint8_t cy = (uint8_t)((299 * r + 587 * g + 114 * b) / 1000);
-    uint8_t cu = (uint8_t)((-169 * r - 331 * g + 500 * b) / 1000 + 128);
-    uint8_t cv = (uint8_t)((500 * r - 419 * g - 81 * b) / 1000 + 128);
-    int cx = (int)((int64_t)_lightX * W / 100);
-    int cyy = (int)((int64_t)_lightY * H / 100);
-    int minDim = (int)MIN(W, H);
-    int radius = (int)((int64_t)_lightDia * minDim / 200);
-    if (radius < 2) return;
-    int innerR = radius * (100 - _lightFea) * 80 / 10000;
-    int maxAlpha = _lightInt * 192 / 100;
-    int radiusSq = radius * radius, innerSq = innerR * innerR;
-    int feather = radiusSq - innerSq;
-    double invA = feather > 0 ? (double)maxAlpha / feather : 0;
-    uint8_t *yp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 0);
-    uint8_t *cp = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 1);
-    size_t ys = CVPixelBufferGetBytesPerRowOfPlane(buf, 0);
-    size_t cs = CVPixelBufferGetBytesPerRowOfPlane(buf, 1);
-    if (!yp || !cp) return;
-    int y0 = MAX(cyy - radius, 0), y1 = MIN(cyy + radius, (int)H);
-    for (int y = y0; y < y1; y++) {
-        int dy = y - cyy, dySq = dy * dy;
-        if (dySq >= radiusSq) continue;
-        uint8_t *row = yp + (size_t)y * ys;
-        int remain = radiusSq - dySq;
-        int dxMax = radius;
-        dxMax = (dxMax + remain / dxMax) / 2;
-        int x0 = MAX(cx - dxMax, 0), x1 = MIN(cx + dxMax, (int)W);
-        int c0 = MAX(cx - innerR, x0), c1 = MIN(cx + innerR, x1);
-        for (int x = x0; x < c0; x++) {
-            int dx = x - cx, dSq = dx * dx + dySq;
-            if (dSq <= innerSq || dSq >= radiusSq) continue;
-            int a = (int)((radiusSq - dSq) * invA);
-            row[x] = (uint8_t)((row[x] * (256 - a) + cy * a) >> 8);
+// ===== [MOD-4] 删除原 injectLight:（已用 applyColorInjectToImage: 替代） =====
+// ===== [MOD-5] 新增 applyColorInjectToImage: / createContourMaskImage: =====
+- (CIImage *)applyColorInjectToImage:(CIImage *)img {
+    if (!img) return img;
+    if (_lightColor == 0) return img;
+    CGRect ext = img.extent;
+    if (ext.size.width < 16 || ext.size.height < 16) return img;
+    CGFloat imgW = ext.size.width, imgH = ext.size.height;
+
+    CGRect faceRect = _lastFaceRect;
+    if (_faceDetectSkip <= 0 || CGRectIsEmpty(faceRect)) {
+        @autoreleasepool {
+            VNDetectFaceLandmarksRequest *req = [[VNDetectFaceLandmarksRequest alloc] init];
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCIImage:img options:@{}];
+            [handler performRequests:@[req] error:nil];
+            NSArray<VNFaceObservation *> *results = req.results;
+
+            if (results.count > 0) {
+                VNFaceObservation *obs = results[0];
+                CGRect bbox = obs.boundingBox;
+                CGFloat bx = bbox.origin.x * imgW;
+                CGFloat by = bbox.origin.y * imgH;
+                CGFloat bw = bbox.size.width  * imgW;
+                CGFloat bh = bbox.size.height * imgH;
+                faceRect = CGRectIntersection(CGRectMake(bx, by, bw, bh), ext);
+                _lastFaceRect = faceRect;
+                _lastFaceTime = mach_absolute_time();
+
+                if (obs.landmarks.faceContour) {
+                    VNFaceLandmarkRegion2D *c = obs.landmarks.faceContour;
+                    if (c.pointCount > 2) {
+                        const CGPoint *pts = [c pointsInImageOfSize:ext.size];
+                        if (pts) {
+                            CGMutablePathRef path = CGPathCreateMutable();
+                            for (NSUInteger i = 0; i < c.pointCount; i++) {
+                                if (i == 0) CGPathMoveToPoint(path, NULL, pts[i].x, pts[i].y);
+                                else        CGPathAddLineToPoint(path, NULL, pts[i].x, pts[i].y);
+                            }
+                            CGPathCloseSubpath(path);
+                            if (_lastFaceContourPath) CGPathRelease(_lastFaceContourPath);
+                            _lastFaceContourPath = path;
+                        }
+                    }
+                }
+            } else {
+                _lastFaceRect = CGRectZero;
+                if (_lastFaceContourPath) { CGPathRelease(_lastFaceContourPath); _lastFaceContourPath = NULL; }
+            }
+            _faceDetectSkip = 3;
         }
-        for (int x = c0; x < c1; x++)
-            row[x] = (uint8_t)((row[x] * (256 - maxAlpha) + cy * maxAlpha) >> 8);
-        for (int x = c1; x < x1; x++) {
-            int dx = x - cx, dSq = dx * dx + dySq;
-            if (dSq <= innerSq || dSq >= radiusSq) continue;
-            int a = (int)((radiusSq - dSq) * invA);
-            row[x] = (uint8_t)((row[x] * (256 - a) + cy * a) >> 8);
-        }
+    } else {
+        _faceDetectSkip--;
     }
-    int bw2 = (int)W / 2, bh2 = (int)H / 2;
-    int cx2 = cx / 2, cy2 = cyy / 2;
-    int r2 = radius / 2, ir2 = innerR / 2;
-    int r2Sq = r2 * r2, ir2Sq = ir2 * ir2;
-    int f2 = r2Sq - ir2Sq;
-    double invC = f2 > 0 ? (double)maxAlpha / f2 : 0;
-    int yc0 = MAX(cy2 - r2, 0), yc1 = MIN(cy2 + r2, bh2);
-    for (int y = yc0; y < yc1; y++) {
-        int dy = y - cy2, dySq = dy * dy;
-        if (dySq >= r2Sq) continue;
-        uint8_t *row = cp + (size_t)y * cs;
-        int remain = r2Sq - dySq;
-        int dxMax = r2 < 1 ? 1 : r2;
-        dxMax = (dxMax + remain / dxMax) / 2;
-        int x0 = MAX(cx2 - dxMax, 0), x1 = MIN(cx2 + dxMax, bw2);
-        int c0 = MAX(cx2 - ir2, x0), c1 = MIN(cx2 + ir2, x1);
-        for (int x = x0; x < c0; x++) {
-            int dx = x - cx2, dSq = dx * dx + dySq;
-            if (dSq <= ir2Sq || dSq >= r2Sq) continue;
-            int a = (int)((r2Sq - dSq) * invC);
-            int i = x * 2;
-            row[i] = (uint8_t)((row[i] * (256 - a) + cu * a) >> 8);
-            row[i+1] = (uint8_t)((row[i+1] * (256 - a) + cv * a) >> 8);
-        }
-        for (int x = c0; x < c1; x++) {
-            int i = x * 2;
-            row[i] = (uint8_t)((row[i] * (256 - maxAlpha) + cu * maxAlpha) >> 8);
-            row[i+1] = (uint8_t)((row[i+1] * (256 - maxAlpha) + cv * maxAlpha) >> 8);
-        }
-        for (int x = c1; x < x1; x++) {
-            int dx = x - cx2, dSq = dx * dx + dySq;
-            if (dSq <= ir2Sq || dSq >= r2Sq) continue;
-            int a = (int)((r2Sq - dSq) * invC);
-            int i = x * 2;
-            row[i] = (uint8_t)((row[i] * (256 - a) + cu * a) >> 8);
-            row[i+1] = (uint8_t)((row[i+1] * (256 - a) + cv * a) >> 8);
-        }
+
+    if (CGRectIsEmpty(faceRect)) return img;
+
+    CIImage *mask = nil;
+    if (_lastFaceContourPath) {
+        mask = [self createContourMaskImage:_lastFaceContourPath extent:ext];
     }
+    if (!mask) {
+        CGFloat mcx = CGRectGetMidX(faceRect), mcy = CGRectGetMidY(faceRect);
+        CGFloat R = MAX(faceRect.size.width, faceRect.size.height) * 0.5;
+        if (R < 1) return img;
+        CIFilter *radial = [CIFilter filterWithName:@"CIRadialGradient"];
+        [radial setValue:[CIVector vectorWithX:mcx Y:mcy] forKey:@"inputCenter"];
+        [radial setValue:@(R * 0.6) forKey:@"inputRadius0"];
+        [radial setValue:@(R)       forKey:@"inputRadius1"];
+        [radial setValue:[CIColor colorWithRed:1 green:1 blue:1 alpha:1] forKey:@"inputColor0"];
+        [radial setValue:[CIColor colorWithRed:1 green:1 blue:1 alpha:0] forKey:@"inputColor1"];
+        mask = [radial.outputImage imageByCroppingToRect:ext];
+    }
+    if (!mask) return img;
+
+    CGFloat r = ((_lightColor >> 16) & 0xFF) / 255.0;
+    CGFloat g = ((_lightColor >>  8) & 0xFF) / 255.0;
+    CGFloat b = ( _lightColor        & 0xFF) / 255.0;
+    CGFloat alpha = _lightInt / 100.0;
+    if (alpha < 0.01) return img;
+    if (alpha > 1.00) alpha = 1.00;
+
+    CIImage *colorImg = [[CIImage imageWithColor:
+        [CIColor colorWithRed:r green:g blue:b alpha:alpha]]
+        imageByCroppingToRect:ext];
+
+    CIFilter *blend = [CIFilter filterWithName:@"CIBlendWithMask"];
+    [blend setValue:colorImg forKey:kCIInputImageKey];
+    [blend setValue:img      forKey:kCIInputBackgroundImageKey];
+    [blend setValue:mask     forKey:@"inputMaskImage"];
+    CIImage *result = blend.outputImage;
+    return result ?: img;
 }
+
+- (CIImage *)createContourMaskImage:(CGPathRef)path extent:(CGRect)ext {
+    if (!path) return nil;
+    size_t w = (size_t)ext.size.width, h = (size_t)ext.size.height;
+    if (w < 4 || h < 4) return nil;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w, cs, kCGImageAlphaNone);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return nil;
+    CGContextSetFillColorWithColor(ctx, [UIColor blackColor].CGColor);
+    CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
+    CGContextSetFillColorWithColor(ctx, [UIColor whiteColor].CGColor);
+    CGContextAddPath(ctx, path);
+    CGContextFillPath(ctx);
+    CGImageRef cgImg = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    if (!cgImg) return nil;
+    CIImage *mask = [CIImage imageWithCGImage:cgImg];
+    CGImageRelease(cgImg);
+    return mask;
+}
+// ===== [MOD-5] end =====
 - (CVPixelBufferRef)process:(CVPixelBufferRef)s targetW:(size_t)tw targetH:(size_t)th CF_RETURNS_RETAINED {
     if (!s) return NULL;
     uint64_t lightSig = ((uint64_t)(_lightOn ? 1 : 0) << 56)
                       | ((uint64_t)(_lightColor & 0xFFFFFF) << 24)
-                      | ((uint64_t)(_lightX & 0x7F) << 17)
-                      | ((uint64_t)(_lightY & 0x7F) << 10)
-                      | ((uint64_t)(_lightInt & 0x7F) << 3)
-                      | (uint64_t)(_lightDia & 0x7);
+                      | ((uint64_t)(_lightInt & 0x7F) << 3);
     int curTotalRot = (_sourceRotation + _rotationAngle) % 360;
     if (curTotalRot < 0) curTotalRot += 360;
     BOOL cacheHit = (_lastOut != NULL)
@@ -1125,39 +1167,37 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     if (extra) CVPixelBufferRelease(extra);
     if (rotOwned) CVPixelBufferRelease(rot);
     if (!baked) return NULL;
-    if (_lightOn && _lightColor != 0 && CVPixelBufferGetPlaneCount(baked) == 2) {
-        size_t bw = CVPixelBufferGetWidth(baked), bh = CVPixelBufferGetHeight(baked);
-        if (!(bw & 1) && !(bh & 1)) {
-            OSType fmt = CVPixelBufferGetPixelFormatType(baked);
-            CVPixelBufferRef canvas = NULL;
-            if (CVPixelBufferCreate(kCFAllocatorDefault, bw, bh, fmt, NULL, &canvas) == noErr && canvas) {
-                CVPixelBufferLockBaseAddress(baked, kCVPixelBufferLock_ReadOnly);
-                CVPixelBufferLockBaseAddress(canvas, 0);
-                for (int p = 0; p < 2; p++) {
-                    const uint8_t *sb = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(baked, p);
-                    uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(canvas, p);
-                    if (!sb || !db) continue;
-                    size_t srs = CVPixelBufferGetBytesPerRowOfPlane(baked, p);
-                    size_t drs = CVPixelBufferGetBytesPerRowOfPlane(canvas, p);
-                    size_t rows = (p == 0) ? bh : bh / 2;
-                    size_t rb = MIN(srs, drs);
-                    for (size_t y = 0; y < rows; y++) memcpy(db + y * drs, sb + y * srs, rb);
+    // ===== [MOD-6] 替换原 injectLight 分支为 CI 人脸跟随注入 =====
+    if (_lightOn && _lightColor != 0 && baked && _ciContext) {
+        @try {
+            size_t bw = CVPixelBufferGetWidth(baked);
+            size_t bh = CVPixelBufferGetHeight(baked);
+            if (bw >= 16 && bh >= 16) {
+                CIImage *ciIn = [CIImage imageWithCVPixelBuffer:baked];
+                if (ciIn) {
+                    CIImage *ciOut = [self applyColorInjectToImage:ciIn];
+                    if (ciOut && ciOut != ciIn) {
+                        OSType fmt = CVPixelBufferGetPixelFormatType(baked);
+                        CVPixelBufferRef newBuf = NULL;
+                        if (CVPixelBufferCreate(kCFAllocatorDefault, bw, bh, fmt, NULL, &newBuf) == noErr && newBuf) {
+                            vcamCopyAttachments(baked, newBuf);
+                            [_ciContext render:ciOut toCVPixelBuffer:newBuf];
+                            CVPixelBufferRelease(baked);
+                            baked = newBuf;
+                        }
+                    }
                 }
-                CVPixelBufferUnlockBaseAddress(baked, kCVPixelBufferLock_ReadOnly);
-                vcamCopyAttachments(baked, canvas);
-                [self injectLight:canvas];
-                CVPixelBufferUnlockBaseAddress(canvas, 0);
-                CVPixelBufferRelease(baked);
-                baked = canvas;
             }
+        } @catch (NSException *e) {
+            vcamLog([NSString stringWithFormat:@"color inject exception: %@", e]);
         }
     }
+    // ===== [MOD-6] end =====
     return baked;
 }
 @end
 
-// ====== 第一段结束，不要在此加 @end（VCBall 的 @end 在第二段）======
-// ====== 第二段请从 "// 渲染核心" 开始接到这里 ======
+// ====== 第 1 段结束（VCProc @end 之后到此）======
 // ======================= 渲染核心 =======================
 @interface VCCore : NSObject
 @property (nonatomic, strong) VCPlayer *player;
@@ -1175,7 +1215,9 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @property (nonatomic, assign) double lastPanX, lastPanY, lastZoom;
 @property (nonatomic, assign) BOOL lastMirror, lastLightOn;
 @property (nonatomic, assign) uint32_t lastLightColor;
-@property (nonatomic, assign) int lastLX, lastLY, lastLI, lastLD, lastLF;
+// ===== [MOD-7] lastLX/lastLY/lastLI/lastLD/lastLF → lastLI =====
+@property (nonatomic, assign) int lastLI;
+// ===== [MOD-7] end =====
 @property (nonatomic, assign) NSInteger lastVideoVersion;
 + (instancetype)shared;
 - (void)startRender;
@@ -1239,18 +1281,14 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         double py = [pl[@"userPanY"] doubleValue];
         double z = [pl[@"userZoom"] doubleValue];
         if (z <= 0) z = 1.0;
+        // ===== [MOD-8] 简化 light 解析: 仅 lightInt =====
         BOOL lon = [pl[@"lightEnabled"] boolValue];
         uint32_t lc = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-        int lx = pl[@"lightX"] ? [pl[@"lightX"] intValue] : 50;
-        int ly = pl[@"lightY"] ? [pl[@"lightY"] intValue] : 50;
-        int li = pl[@"lightIntensity"] ? [pl[@"lightIntensity"] intValue] : 30;
-        int ld = pl[@"lightDiameter"] ? [pl[@"lightDiameter"] intValue] : 48;
-        int lf = pl[@"lightFeather"] ? [pl[@"lightFeather"] intValue] : 100;
-        if (lx <= 0 || lx > 100) lx = 50;
-        if (ly <= 0 || ly > 100) ly = 50;
-        if (li < 0 || li > 100) li = 30;
-        if (ld <= 0 || ld > 100) ld = 48;
-        if (lf < 0 || lf > 100) lf = 100;
+        int li = [pl[@"lightIntensity"] intValue];
+        if (li < 0)   li = 0;
+        if (li > 100) li = 100;
+        if (li == 0 && !pl[@"lightIntensity"]) li = 35;
+        // ===== [MOD-8] end =====
         BOOL paused = [pl[@"paused"] boolValue];
         NSString *path = [pl[@"activePlaybackPath"] isKindOfClass:[NSString class]] ? pl[@"activePlaybackPath"] : nil;
         NSInteger videoVer = [pl[@"vcamVideoVersion"] integerValue];
@@ -1258,21 +1296,21 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         BOOL rotChanged = (rot != _lastRot);
         BOOL mirrorChanged = (mirror != _lastMirror);
         BOOL panChanged = (px != _lastPanX || py != _lastPanY || z != _lastZoom);
-        BOOL lightChanged = (lon != _lastLightOn || lc != _lastLightColor ||
-                             lx != _lastLX || ly != _lastLY || li != _lastLI || ld != _lastLD || lf != _lastLF);
+        // ===== [MOD-8] lightChanged 3 项比较 =====
+        BOOL lightChanged = (lon != _lastLightOn || lc != _lastLightColor || li != _lastLI);
+        // ===== [MOD-8] end =====
         if (enChanged || rotChanged || mirrorChanged || panChanged || lightChanged) {
             [_renderLock lock];
             if (enChanged) { _lastEn = en; _enabled = (en == 1); }
             if (rotChanged) { _lastRot = rot; _proc.rotationAngle = (int)(rot % 360); }
             if (mirrorChanged) { _lastMirror = mirror; _proc.mirrored = mirror; }
             if (panChanged) { _lastPanX = px; _lastPanY = py; _lastZoom = z; _proc.panX = px; _proc.panY = py; _proc.zoom = z; }
+            // ===== [MOD-8] lightChanged 应用 =====
             if (lightChanged) {
-                _lastLightOn = lon; _lastLightColor = lc;
-                _lastLX = lx; _lastLY = ly; _lastLI = li; _lastLD = ld; _lastLF = lf;
-                _proc.lightOn = lon; _proc.lightColor = lc;
-                _proc.lightX = lx; _proc.lightY = ly;
-                _proc.lightInt = li; _proc.lightDia = ld; _proc.lightFea = lf;
+                _lastLightOn = lon; _lastLightColor = lc; _lastLI = li;
+                _proc.lightOn = lon; _proc.lightColor = lc; _proc.lightInt = li;
             }
+            // ===== [MOD-8] end =====
             [_renderLock unlock];
         }
         if (enChanged && _enabled) [_player start];
@@ -1444,9 +1482,7 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
 }
 @end
 
-// ===== [彩色注入修复] 屏幕边缘取色（1:1 对齐参考源码 Tweak.xm 的 sampleScreenColor）=====
-// 截图三级回退：UIScreen._snapshotIncludingStatusBar: → UIApplication._screenshot
-//               → SpringBoard 窗口层级 drawViewHierarchy
+// ===== [彩色注入修复] 屏幕边缘取色（对齐 002 sampleScreenColor）=====
 static CGImageRef vcamTakeScreenSnapshot(void) {
     UIImage *snapshot = nil;
     @try {
@@ -1499,8 +1535,6 @@ static CGImageRef vcamTakeScreenSnapshot(void) {
     return img;
 }
 
-// 四边 15% 条带采样：单带 sat>0.2 && maxC>0.25 计入；汇总后 sat>0.15 && maxC>0.2 才有效。
-// 取到什么 RGB 就返回什么 RGB（不再限制 6 种已知色），否则返回 0。
 static uint32_t vcamPickEdgeColor(CGImageRef cgImg, int *outValidSamples) {
     if (outValidSamples) *outValidSamples = 0;
     if (!cgImg) return 0;
@@ -1514,10 +1548,10 @@ static uint32_t vcamPickEdgeColor(CGImageRef cgImg, int *outValidSamples) {
     if (edgeW >= w) edgeW = w / 2;
     if (edgeH >= h) edgeH = h / 2;
     CGRect rects[4] = {
-        CGRectMake(0, 0, (CGFloat)w, (CGFloat)edgeH),                                   // top
-        CGRectMake(0, (CGFloat)(h - edgeH), (CGFloat)w, (CGFloat)edgeH),                // bottom
-        CGRectMake(0, (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)),        // left
-        CGRectMake((CGFloat)(w - edgeW), (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)), // right
+        CGRectMake(0, 0, (CGFloat)w, (CGFloat)edgeH),
+        CGRectMake(0, (CGFloat)(h - edgeH), (CGFloat)w, (CGFloat)edgeH),
+        CGRectMake(0, (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)),
+        CGRectMake((CGFloat)(w - edgeW), (CGFloat)edgeH, (CGFloat)edgeW, (CGFloat)(h - 2 * edgeH)),
     };
     CGFloat tR = 0, tG = 0, tB = 0;
     int valid = 0;
@@ -1643,7 +1677,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 @property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
 @property (nonatomic, assign) BOOL visible, floating, paused, lightPageActive;
 @property (nonatomic, assign) int buildRetries;
-@property (nonatomic, strong) NSTimer *screenPickTimer;  // [彩色注入修复] 屏幕采样定时器
+@property (nonatomic, strong) NSTimer *screenPickTimer;
 + (instancetype)shared;
 - (void)show;
 - (void)hide;
@@ -1671,9 +1705,9 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)resetTransform;
 - (void)toggleMirror;
 - (void)toggleLight;
-- (void)startScreenSampling;   // [彩色注入修复]
-- (void)stopScreenSampling;    // [彩色注入修复]
-- (void)screenSampleTick;      // [彩色注入修复]
+- (void)startScreenSampling;
+- (void)stopScreenSampling;
+- (void)screenSampleTick;
 - (void)ballTap;
 - (void)ballDrag:(UIPanGestureRecognizer *)g;
 - (void)switchCtrlTab;
@@ -1703,7 +1737,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 }
 - (void)hide {
     _floating = NO;
-    [self stopScreenSampling];  // [彩色注入修复] 停止屏幕采样
+    [self stopScreenSampling];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.win removeFromSuperview];
         self.win.hidden = YES;
@@ -1842,10 +1876,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _lightBtn = makeRetroBtn(@"彩色注入 · OFF", CGRectMake(pad, y, contentW, btnH), self, @selector(toggleLight));
     [page addSubview:_lightBtn];
 }
+
+// ===== [MOD-9] buildLightPage 完整替换: 6 色 + 1 强度滑条（对齐 002 自动注入）=====
 - (void)buildLightPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
     _colorBtns = [NSMutableArray array];
     _sliders = [NSMutableArray array];
     _sliderValueLabels = [NSMutableArray array];
+
     CGFloat y = 4;
     uint32_t colors[6] = {0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF};
     NSString *names[6] = {@"红", @"绿", @"蓝", @"黄", @"青", @"紫"};
@@ -1855,43 +1892,58 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     for (int i = 0; i < 6; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
         b.frame = CGRectMake(startX + i * (dotSize + dotGap), y, dotSize, dotSize);
-        b.backgroundColor = [UIColor colorWithRed:((colors[i] >> 16) & 0xFF) / 255.0 green:((colors[i] >> 8) & 0xFF) / 255.0 blue:(colors[i] & 0xFF) / 255.0 alpha:1.0];
-        b.layer.cornerRadius = dotSize / 2; b.layer.borderWidth = 2; b.layer.borderColor = CDeep().CGColor;
+        b.backgroundColor = [UIColor colorWithRed:((colors[i] >> 16) & 0xFF) / 255.0
+                                           green:((colors[i] >>  8) & 0xFF) / 255.0
+                                            blue:( colors[i]        & 0xFF) / 255.0 alpha:1.0];
+        b.layer.cornerRadius = dotSize / 2;
+        b.layer.borderWidth = 2;
+        b.layer.borderColor = CDeep().CGColor;
         b.tag = (NSInteger)colors[i];
         [b setTitle:names[i] forState:UIControlStateNormal];
         [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont boldSystemFontOfSize:10];
         [b addTarget:self action:@selector(colorTapped:) forControlEvents:UIControlEventTouchUpInside];
-        [page addSubview:b]; [_colorBtns addObject:b];
+        [page addSubview:b];
+        [_colorBtns addObject:b];
     }
-    y += dotSize + 6;
-    NSString *titles[5] = {@"强度", @"直径", @"X", @"Y", @"羽化"};
-    NSString *keys[5] = {@"lightIntensity", @"lightDiameter", @"lightX", @"lightY", @"lightFeather"};
-    int defaults[5] = {30, 48, 50, 50, 100};
+    y += dotSize + 12;
+
     NSDictionary *pl = plRead();
-    CGFloat rowH = 30, rowGap = 6, sliderX = pad + 44, valueW = 34;
-    CGFloat sliderW = contentW - 44 - valueW - 6;
-    for (int i = 0; i < 5; i++) {
-        CGFloat ry = y + i * (rowH + rowGap);
-        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(pad, ry + 5, 44, 20)];
-        t.text = titles[i]; t.textColor = CGlow(); t.font = [UIFont systemFontOfSize:12];
-        [page addSubview:t];
-        UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, ry, sliderW, 30)];
-        s.minimumValue = 0; s.maximumValue = 100;
-        NSNumber *val = pl[keys[i]];
-        int v = val ? [val intValue] : defaults[i];
-        if (v < 0) v = 0; if (v > 100) v = 100;
-        s.value = (float)v;
-        s.minimumTrackTintColor = CBtnBorder(); s.maximumTrackTintColor = CBtnBg(); s.thumbTintColor = CGlow();
-        s.tag = i;
-        [s addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-        [s addTarget:self action:@selector(sliderCommit:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-        [page addSubview:s]; [_sliders addObject:s];
-        UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - valueW, ry + 5, valueW, 20)];
-        vl.text = [NSString stringWithFormat:@"%d", v]; vl.textColor = CTextMain(); vl.font = [UIFont boldSystemFontOfSize:12]; vl.textAlignment = NSTextAlignmentRight;
-        [page addSubview:vl]; [_sliderValueLabels addObject:vl];
-    }
+    int v = [pl[@"lightIntensity"] intValue];
+    if (v < 0)   v = 0;
+    if (v > 100) v = 100;
+    if (v == 0 && !pl[@"lightIntensity"]) v = 35;
+
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(pad, y + 5, 44, 20)];
+    t.text = @"强度";
+    t.textColor = CGlow();
+    t.font = [UIFont systemFontOfSize:12];
+    [page addSubview:t];
+
+    CGFloat sliderW = contentW - 44 - 34 - 6;
+    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(pad + 44, y, sliderW, 30)];
+    s.minimumValue = 0;
+    s.maximumValue = 100;
+    s.value = (float)v;
+    s.minimumTrackTintColor = CBtnBorder();
+    s.maximumTrackTintColor = CBtnBg();
+    s.thumbTintColor = CGlow();
+    s.tag = 0;
+    [s addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+    [s addTarget:self action:@selector(sliderCommit:)  forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    [page addSubview:s];
+    [_sliders addObject:s];
+
+    UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - 34, y + 5, 34, 20)];
+    vl.text = [NSString stringWithFormat:@"%d", v];
+    vl.textColor = CTextMain();
+    vl.font = [UIFont boldSystemFontOfSize:12];
+    vl.textAlignment = NSTextAlignmentRight;
+    [page addSubview:vl];
+    [_sliderValueLabels addObject:vl];
 }
+// ===== [MOD-9] end =====
+
 - (void)switchCtrlTab { _lightPageActive = NO; _ctrlPage.hidden = NO; _lightPage.hidden = YES; [self refreshTabStyles]; }
 - (void)switchLightTab { _lightPageActive = YES; _ctrlPage.hidden = YES; _lightPage.hidden = NO; [self refreshTabStyles]; }
 - (void)refreshTabStyles {
@@ -1902,14 +1954,18 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [_tabLightBtn setBackgroundColor:(_lightPageActive ? activeBg : inactiveBg)];
 }
 - (void)colorTapped:(UIButton *)b {
-    // [彩色注入修复] 手动选色优先：停掉自动采样，防止被屏幕颜色覆盖
     [self stopScreenSampling];
     plSetMany(@{@"lightColor": @((uint32_t)b.tag), @"lightEnabled": @YES});
     [self refreshVisuals];
     [self toast:@"颜色已设置"];
 }
 - (void)sliderChanged:(UISlider *)s { if (s.tag < 0 || s.tag >= (NSInteger)_sliderValueLabels.count) return; UILabel *vl = _sliderValueLabels[s.tag]; vl.text = [NSString stringWithFormat:@"%d", (int)lroundf(s.value)]; }
-- (void)sliderCommit:(UISlider *)s { if (s.tag < 0 || s.tag >= 5) return; NSString *keys[5] = {@"lightIntensity", @"lightDiameter", @"lightX", @"lightY", @"lightFeather"}; plSet(keys[s.tag], @((int)lroundf(s.value))); }
+// ===== [MOD-10] sliderCommit: 仅 tag=0 强度滑条 =====
+- (void)sliderCommit:(UISlider *)s {
+    if (s.tag != 0) return;
+    plSet(@"lightIntensity", @((int)lroundf(s.value)));
+}
+// ===== [MOD-10] end =====
 - (void)ballTap {
     _visible = !_visible;
     if (_visible) { [self layoutPanel]; _panel.hidden = NO; [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 1; }]; }
@@ -2048,9 +2104,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)toggleLight {
     BOOL on = [plRead()[@"lightEnabled"] boolValue];
     if (!on) {
-        // [彩色注入修复] 对齐参考源码 toggleColorInject:
-        // 打开时不强制任何颜色。lightColor==0 时 injectLight: 直接 return → 人脸保持原样；
-        // 同时启动 30Hz 屏幕边缘采样，采到有效色才写入 lightColor。
         plSet(@"lightEnabled", @YES);
         [self startScreenSampling];
         [self toast:@"彩色注入开 · 自动取色中"];
@@ -2062,10 +2115,9 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [self refreshVisuals];
 }
 
-// ===== [彩色注入修复] 对齐参考源码 startColorSampling / stopColorSampling / sampleScreenColor =====
+// ===== [彩色注入修复] 30Hz 屏幕采样（对齐 002 startColorSampling）=====
 - (void)startScreenSampling {
     [self stopScreenSampling];
-    // 1/30s，与参考源码 30Hz 采样一致
     _screenPickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0
                                                        repeats:YES
                                                          block:^(NSTimer *t) {
@@ -2089,16 +2141,13 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         CGImageRelease(img);
 
         if (valid == 0) {
-            // 屏幕没有任何彩色条带 → 清零（对齐参考源码 else if (validSamples == 0) 分支）
             uint32_t cur = (uint32_t)[plRead()[@"lightColor"] unsignedIntValue];
             if (cur != 0) plSet(@"lightColor", @(0));
             return;
         }
         if (color == 0) {
-            // 有彩色但汇总后不够饱和/亮度 → 保持上一次颜色（对齐参考源码"不清零"分支）
             return;
         }
-        // 有效颜色 → 取到什么就写什么
         uint32_t cur = (uint32_t)[plRead()[@"lightColor"] unsignedIntValue];
         if (cur != color) {
             plSet(@"lightColor", @(color));
@@ -2122,11 +2171,37 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     }];
 }
 
-// ===== [彩色注入修复] 清理屏幕采样定时器 =====
 - (void)dealloc {
     [self stopScreenSampling];
 }
-// ===== [彩色注入修复] end =====
 @end
 
-// =================
+// ======================= 入口 =======================
+static void vcamInit(void) {
+    if (vcamLoadedViaOtherPath()) return;
+    [[NSFileManager defaultManager] createDirectoryAtPath:@"/var/mobile/Media/DCIM"
+                             withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *procName = [[NSProcessInfo processInfo] processName];
+    vcamLoadBeacon(procName);
+    vcamLog([NSString stringWithFormat:@"vcamInit in %@", procName]);
+
+    if ([procName isEqualToString:@"mediaserverd"]) {
+        [[VCCore shared] startRender];
+        [[VCCore shared] startPolling];
+        installHooks();
+    } else if ([procName isEqualToString:@"SpringBoard"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [[VCBall shared] show];
+        });
+    }
+}
+
+__attribute__((constructor))
+static void vcamCtor(void) {
+    @autoreleasepool {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            vcamInit();
+        });
+    }
+}
