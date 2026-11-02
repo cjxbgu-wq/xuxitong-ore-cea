@@ -963,6 +963,13 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 - (CIImage *)applyColorInjectToImage:(CIImage *)img {
     if (!img) return img;
     if (_lightColor == 0) return img;
+    // [FIX-COLOR-RGB0] lightColor 非 0 但 RGB 实际全 0 时也不注入
+    {
+        CGFloat cr = ((_lightColor >> 16) & 0xFF) / 255.0;
+        CGFloat cg = ((_lightColor >>  8) & 0xFF) / 255.0;
+        CGFloat cb = ( _lightColor        & 0xFF) / 255.0;
+        if (cr < 0.01 && cg < 0.01 && cb < 0.01) return img;
+    }
     CGRect ext = img.extent;
     if (ext.size.width < 16 || ext.size.height < 16) return img;
     CGFloat imgW = ext.size.width, imgH = ext.size.height;
@@ -1214,9 +1221,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
 @property (nonatomic, assign) double lastPanX, lastPanY, lastZoom;
 @property (nonatomic, assign) BOOL lastMirror, lastLightOn;
 @property (nonatomic, assign) uint32_t lastLightColor;
-// ===== [MOD-7] lastLX/lastLY/lastLI/lastLD/lastLF → lastLI =====
 @property (nonatomic, assign) int lastLI;
-// ===== [MOD-7] end =====
 @property (nonatomic, assign) NSInteger lastVideoVersion;
 + (instancetype)shared;
 - (void)startRender;
@@ -1280,14 +1285,12 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         double py = [pl[@"userPanY"] doubleValue];
         double z = [pl[@"userZoom"] doubleValue];
         if (z <= 0) z = 1.0;
-        // ===== [MOD-8] 简化 light 解析: 仅 lightInt =====
         BOOL lon = [pl[@"lightEnabled"] boolValue];
         uint32_t lc = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
         int li = [pl[@"lightIntensity"] intValue];
         if (li < 0)   li = 0;
         if (li > 100) li = 100;
         if (li == 0 && !pl[@"lightIntensity"]) li = 35;
-        // ===== [MOD-8] end =====
         BOOL paused = [pl[@"paused"] boolValue];
         NSString *path = [pl[@"activePlaybackPath"] isKindOfClass:[NSString class]] ? pl[@"activePlaybackPath"] : nil;
         NSInteger videoVer = [pl[@"vcamVideoVersion"] integerValue];
@@ -1295,21 +1298,17 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
         BOOL rotChanged = (rot != _lastRot);
         BOOL mirrorChanged = (mirror != _lastMirror);
         BOOL panChanged = (px != _lastPanX || py != _lastPanY || z != _lastZoom);
-        // ===== [MOD-8] lightChanged 3 项比较 =====
         BOOL lightChanged = (lon != _lastLightOn || lc != _lastLightColor || li != _lastLI);
-        // ===== [MOD-8] end =====
         if (enChanged || rotChanged || mirrorChanged || panChanged || lightChanged) {
             [_renderLock lock];
             if (enChanged) { _lastEn = en; _enabled = (en == 1); }
             if (rotChanged) { _lastRot = rot; _proc.rotationAngle = (int)(rot % 360); }
             if (mirrorChanged) { _lastMirror = mirror; _proc.mirrored = mirror; }
             if (panChanged) { _lastPanX = px; _lastPanY = py; _lastZoom = z; _proc.panX = px; _proc.panY = py; _proc.zoom = z; }
-            // ===== [MOD-8] lightChanged 应用 =====
             if (lightChanged) {
                 _lastLightOn = lon; _lastLightColor = lc; _lastLI = li;
                 _proc.lightOn = lon; _proc.lightColor = lc; _proc.lightInt = li;
             }
-            // ===== [MOD-8] end =====
             [_renderLock unlock];
         }
         if (enChanged && _enabled) [_player start];
@@ -1481,19 +1480,43 @@ static UIColor *CDeep(void)      { return [UIColor colorWithRed:0.02 green:0.04 
 }
 @end
 
-// ===== [彩色注入修复] 屏幕边缘取色（对齐 002 sampleScreenColor）=====
+// [FIX-COLOR-2] 优先窗口层级绘制并排除 VCOverlayWindow，避免取色把悬浮球/面板绿色采进去
 static CGImageRef vcamTakeScreenSnapshot(void) {
     UIImage *snapshot = nil;
+
     @try {
-        UIScreen *screen = [UIScreen mainScreen];
-        SEL sel = NSSelectorFromString(@"_snapshotIncludingStatusBar:");
-        if ([screen respondsToSelector:sel]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            snapshot = [screen performSelector:sel withObject:@(NO)];
-#pragma clang diagnostic pop
+        UIWindow *keyWindow = nil;
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                for (UIWindow *w in ws.windows) {
+                    if ([w isKindOfClass:[VCOverlayWindow class]]) continue;
+                    if (w.isKeyWindow) { keyWindow = w; break; }
+                    if (!keyWindow) keyWindow = w;
+                }
+                if (keyWindow) break;
+            }
+        }
+        if (keyWindow) {
+            UIGraphicsBeginImageContextWithOptions(keyWindow.bounds.size, YES, 0.25);
+            [keyWindow drawViewHierarchyInRect:keyWindow.bounds afterScreenUpdates:NO];
+            snapshot = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
         }
     } @catch (NSException *e) {}
+
+    if (!snapshot) {
+        @try {
+            UIScreen *screen = [UIScreen mainScreen];
+            SEL sel = NSSelectorFromString(@"_snapshotIncludingStatusBar:");
+            if ([screen respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                snapshot = [screen performSelector:sel withObject:@(NO)];
+#pragma clang diagnostic pop
+            }
+        } @catch (NSException *e) {}
+    }
 
     if (!snapshot) {
         @try {
@@ -1508,26 +1531,6 @@ static CGImageRef vcamTakeScreenSnapshot(void) {
         } @catch (NSException *e) {}
     }
 
-    if (!snapshot) {
-        @try {
-            UIWindow *keyWindow = nil;
-            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if ([scene isKindOfClass:[UIWindowScene class]]) {
-                    UIWindowScene *ws = (UIWindowScene *)scene;
-                    for (UIWindow *w in ws.windows) {
-                        if ([w isKindOfClass:[VCOverlayWindow class]]) continue;
-                        if (w.isKeyWindow || !keyWindow) { keyWindow = w; }
-                    }
-                    if (keyWindow) break;
-                }
-            }
-            if (!keyWindow) return NULL;
-            UIGraphicsBeginImageContextWithOptions(keyWindow.bounds.size, YES, 0.25);
-            [keyWindow drawViewHierarchyInRect:keyWindow.bounds afterScreenUpdates:NO];
-            snapshot = UIGraphicsGetImageFromCurrentImageContext();
-            UIGraphicsEndImageContext();
-        } @catch (NSException *e) {}
-    }
     if (!snapshot) return NULL;
     CGImageRef img = snapshot.CGImage;
     if (img) CGImageRetain(img);
@@ -1540,12 +1543,15 @@ static uint32_t vcamPickEdgeColor(CGImageRef cgImg, int *outValidSamples) {
     size_t w = CGImageGetWidth(cgImg);
     size_t h = CGImageGetHeight(cgImg);
     if (!w || !h) return 0;
-    size_t edgeW = w * 15 / 100;
-    size_t edgeH = h * 15 / 100;
-    if (edgeW < 1) edgeW = 1;
-    if (edgeH < 1) edgeH = 1;
+
+    // [FIX-COLOR-2] 15% -> 3%，避开悬浮球/面板，只取屏幕最外圈真实彩色边框
+    size_t edgeW = w * 3 / 100;
+    size_t edgeH = h * 3 / 100;
+    if (edgeW < 2) edgeW = 2;
+    if (edgeH < 2) edgeH = 2;
     if (edgeW >= w) edgeW = w / 2;
     if (edgeH >= h) edgeH = h / 2;
+
     CGRect rects[4] = {
         CGRectMake(0, 0, (CGFloat)w, (CGFloat)edgeH),
         CGRectMake(0, (CGFloat)(h - edgeH), (CGFloat)w, (CGFloat)edgeH),
@@ -1592,7 +1598,6 @@ static uint32_t vcamPickEdgeColor(CGImageRef cgImg, int *outValidSamples) {
     if (bi > 255) bi = 255;
     return (ri << 16) | (gi << 8) | bi;
 }
-// ===== [彩色注入修复] end =====
 
 @interface VCBallView : UIView
 @property (nonatomic, strong) UILabel *mainLabel;
@@ -1664,7 +1669,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     return b;
 }
 
-// ===== [MOD-UI-1] VCBall 接口新增属性/方法 =====
 @interface VCBall : NSObject <PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) VCBallView *ball;
@@ -1672,11 +1676,12 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 @property (nonatomic, strong) UIView *ctrlPage, *lightPage;
 @property (nonatomic, strong) UIButton *tabCtrlBtn, *tabLightBtn;
 @property (nonatomic, strong) UIButton *replaceBtn, *playBtn, *mirrorBtn, *lightBtn;
-@property (nonatomic, strong) UIButton *lightPlusBtn, *lightMinusBtn;
 @property (nonatomic, strong) UIButton *reserveBtn1, *reserveBtn2;
 @property (nonatomic, strong) UIView *lightColorIndicator;
 @property (nonatomic, strong) UILabel *lightColorLabel;
 @property (nonatomic, strong) UILabel *lightSampleStateLabel;
+@property (nonatomic, strong) UISlider *lightIntensitySlider;
+@property (nonatomic, strong) UILabel *lightIntensityValueLabel;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *colorBtns;
 @property (nonatomic, strong) NSMutableArray<UILabel *> *sliderValueLabels;
 @property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
@@ -1711,8 +1716,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)resetTransform;
 - (void)toggleMirror;
 - (void)toggleLight;
-- (void)lightIntensityUp;
-- (void)lightIntensityDown;
 - (void)startScreenSampling;
 - (void)stopScreenSampling;
 - (void)screenSampleTick;
@@ -1729,7 +1732,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (BOOL)isVideoProvider:(NSItemProvider *)p;
 - (BOOL)isImageProvider:(NSItemProvider *)p;
 @end
-// ===== [MOD-UI-1] end =====
 
 @implementation VCBall
 + (instancetype)shared {
@@ -1809,9 +1811,8 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [self buildPanel];
     [_win addSubview:_ball];
 }
-// ===== [MOD-UI-2] buildPanel 面板高度 400 -> 430，给彩色3键+增强/减少行留空间 =====
 - (void)buildPanel {
-    CGFloat pw = 250, ph = 430, pad = 12; // [MOD-UI-2] 原 400 改为 430
+    CGFloat pw = 250, ph = 430, pad = 12;
     _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     _panel.backgroundColor = CBgDeep();
     _panel.layer.borderWidth = 1;
@@ -1845,12 +1846,16 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [self refreshVisuals];
     [_win addSubview:_panel];
 }
-// ===== [MOD-UI-3] buildCtrlPage 完整替换：±缩放键与方向键加大左右间隙；彩色3键位；增强/减少移到彩色注入下面 =====
 - (void)buildCtrlPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
+    if (!_sliders) _sliders = [NSMutableArray array];
+    if (!_sliderValueLabels) _sliderValueLabels = [NSMutableArray array];
+    [_sliders removeAllObjects];
+    [_sliderValueLabels removeAllObjects];
+
     CGFloat y = 0, btnH = 30, gap = 8;
 
-    // [MOD-UI-3] 原 smallW=32/cell=44/dg=4，±紧挨方向键；改为 sideGap=10，左右留出误触间隔
-    CGFloat cell = 42, dg = 4, smallW = 30, sideGap = 10;
+    // [FIX-UI-1] ± 与左右方向键间隙 14 -> 16，再外移一点，防误点；顺序不变
+    CGFloat cell = 42, dg = 4, smallW = 30, sideGap = 16;
     CGFloat dpadTotal = smallW + sideGap + cell + dg + cell + dg + cell + sideGap + smallW;
     CGFloat dpadStartX = pad + (contentW - dpadTotal) / 2.0;
 
@@ -1874,7 +1879,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [page addSubview:_playBtn];
     y += btnH + gap;
 
-    // [MOD-UI-3] ±缩放键外移，与左右方向键间隔 sideGap
     CGFloat xMinus = dpadStartX;
     CGFloat xLeft  = dpadStartX + smallW + sideGap;
     CGFloat xMid   = xLeft + cell + dg;
@@ -1895,10 +1899,10 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [page addSubview:rs]; [page addSubview:minus]; [page addSubview:plus];
     y += cell * 3 + dg * 2 + gap;
 
-    // [MOD-UI-3] 彩色注入改为3键位：1彩色 + 2预留；预留禁用占位
+    // 三色 3 键位：1 三色 + 2 预留
     CGFloat colorGap = 6;
     CGFloat colorW = (contentW - colorGap * 2) / 3.0;
-    _lightBtn = makeRetroBtn(@"彩色注入 · OFF", CGRectMake(pad, y, colorW, btnH), self, @selector(toggleLight));
+    _lightBtn = makeRetroBtn(@"三色 · OFF", CGRectMake(pad, y, colorW, btnH), self, @selector(toggleLight));
     [page addSubview:_lightBtn];
 
     _reserveBtn1 = makeRetroBtn(@"预留", CGRectMake(pad + colorW + colorGap, y, colorW, btnH), nil, nil);
@@ -1912,22 +1916,47 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [page addSubview:_reserveBtn2];
     y += btnH + gap;
 
-    // [MOD-UI-3] 彩色加减增强移到彩色注入下面
-    CGFloat halfW = (contentW - colorGap) / 2.0;
-    _lightMinusBtn = makeRetroBtn(@"彩色减少", CGRectMake(pad, y, halfW, btnH), self, @selector(lightIntensityDown));
-    _lightPlusBtn  = makeRetroBtn(@"彩色增强", CGRectMake(pad + halfW + colorGap, y, halfW, btnH), self, @selector(lightIntensityUp));
-    [page addSubview:_lightMinusBtn];
-    [page addSubview:_lightPlusBtn];
+    // 删除后加的增强/减少按钮；把打光页强度滑条移到这里
+    NSDictionary *pl = plRead();
+    int v = [pl[@"lightIntensity"] intValue];
+    if (!pl[@"lightIntensity"]) v = 35;
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(pad, y + 5, 44, 20)];
+    t.text = @"强度";
+    t.textColor = CGlow();
+    t.font = [UIFont systemFontOfSize:12];
+    [page addSubview:t];
+
+    CGFloat sliderW = contentW - 44 - 34 - 6;
+    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(pad + 44, y, sliderW, 30)];
+    s.minimumValue = 0;
+    s.maximumValue = 100;
+    s.value = (float)v;
+    s.minimumTrackTintColor = CBtnBorder();
+    s.maximumTrackTintColor = CBtnBg();
+    s.thumbTintColor = CGlow();
+    s.tag = 0;
+    [s addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+    [s addTarget:self action:@selector(sliderCommit:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    [page addSubview:s];
+    [_sliders addObject:s];
+    _lightIntensitySlider = s;
+
+    UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - 34, y + 5, 34, 20)];
+    vl.text = [NSString stringWithFormat:@"%d", v];
+    vl.textColor = CTextMain();
+    vl.font = [UIFont boldSystemFontOfSize:12];
+    vl.textAlignment = NSTextAlignmentRight;
+    [page addSubview:vl];
+    [_sliderValueLabels addObject:vl];
+    _lightIntensityValueLabel = vl;
 }
-// ===== [MOD-UI-4] buildLightPage 完整替换：顶部新增取色器窗口/颜色指示/状态；保留6色+强度滑条 =====
 - (void)buildLightPage:(UIView *)page width:(CGFloat)pw pad:(CGFloat)pad contentW:(CGFloat)contentW pageH:(CGFloat)pageH {
     _colorBtns = [NSMutableArray array];
-    _sliders = [NSMutableArray array];
-    _sliderValueLabels = [NSMutableArray array];
-
     CGFloat y = 4;
 
-    // [MOD-UI-4] 取色器窗口：颜色圆 + 当前色值 + 自动取色状态
     _lightColorIndicator = [[UIView alloc] initWithFrame:CGRectMake(pad, y, 52, 52)];
     _lightColorIndicator.backgroundColor = [UIColor darkGrayColor];
     _lightColorIndicator.layer.cornerRadius = 26;
@@ -1972,46 +2001,9 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         [page addSubview:b];
         [_colorBtns addObject:b];
     }
-    y += dotSize + 12;
-
-    NSDictionary *pl = plRead();
-    int v = [pl[@"lightIntensity"] intValue];
-    if (!pl[@"lightIntensity"]) v = 35;
-    if (v < 0)   v = 0;
-    if (v > 100) v = 100;
-
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(pad, y + 5, 44, 20)];
-    t.text = @"强度";
-    t.textColor = CGlow();
-    t.font = [UIFont systemFontOfSize:12];
-    [page addSubview:t];
-
-    CGFloat sliderW = contentW - 44 - 34 - 6;
-    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(pad + 44, y, sliderW, 30)];
-    s.minimumValue = 0;
-    s.maximumValue = 100;
-    s.value = (float)v;
-    s.minimumTrackTintColor = CBtnBorder();
-    s.maximumTrackTintColor = CBtnBg();
-    s.thumbTintColor = CGlow();
-    s.tag = 0;
-    [s addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-    [s addTarget:self action:@selector(sliderCommit:)  forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-    [page addSubview:s];
-    [_sliders addObject:s];
-
-    UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - 34, y + 5, 34, 20)];
-    vl.text = [NSString stringWithFormat:@"%d", v];
-    vl.textColor = CTextMain();
-    vl.font = [UIFont boldSystemFontOfSize:12];
-    vl.textAlignment = NSTextAlignmentRight;
-    [page addSubview:vl];
-    [_sliderValueLabels addObject:vl];
 
     [self refreshLightColorIndicator];
 }
-// ===== [MOD-UI-4] end =====
-
 - (void)switchCtrlTab { _lightPageActive = NO; _ctrlPage.hidden = NO; _lightPage.hidden = YES; [self refreshTabStyles]; }
 - (void)switchLightTab { _lightPageActive = YES; _ctrlPage.hidden = YES; _lightPage.hidden = NO; [self refreshTabStyles]; }
 - (void)refreshTabStyles {
@@ -2021,7 +2013,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [_tabLightBtn setTitleColor:(_lightPageActive ? activeFg : inactiveFg) forState:UIControlStateNormal];
     [_tabLightBtn setBackgroundColor:(_lightPageActive ? activeBg : inactiveBg)];
 }
-// ===== [MOD-COLOR-3] colorTapped 完整替换：固定颜色后刷新取色器状态 =====
 - (void)colorTapped:(UIButton *)b {
     [self stopScreenSampling];
     plSetMany(@{@"lightColor": @((uint32_t)b.tag), @"lightEnabled": @YES});
@@ -2029,14 +2020,16 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     [self refreshLightColorIndicator];
     [self toast:@"颜色已设置"];
 }
-- (void)sliderChanged:(UISlider *)s { if (s.tag < 0 || s.tag >= (NSInteger)_sliderValueLabels.count) return; UILabel *vl = _sliderValueLabels[s.tag]; vl.text = [NSString stringWithFormat:@"%d", (int)lroundf(s.value)]; }
-// ===== [MOD-COLOR-7] sliderCommit 完整替换：强度提交后刷新取色器状态 =====
+- (void)sliderChanged:(UISlider *)s {
+    if (s.tag < 0 || s.tag >= (NSInteger)_sliderValueLabels.count) return;
+    UILabel *vl = _sliderValueLabels[s.tag];
+    vl.text = [NSString stringWithFormat:@"%d", (int)lroundf(s.value)];
+}
 - (void)sliderCommit:(UISlider *)s {
     if (s.tag != 0) return;
     plSet(@"lightIntensity", @((int)lroundf(s.value)));
     [self refreshLightColorIndicator];
 }
-// ===== [MOD-COLOR-7] end =====
 - (void)ballTap {
     _visible = !_visible;
     if (_visible) { [self layoutPanel]; _panel.hidden = NO; [UIView animateWithDuration:0.2 animations:^{ _panel.alpha = 1; }]; }
@@ -2059,7 +2052,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     py = MAX(5, MIN(_win.frame.size.height - ph - 5, py));
     _panel.frame = CGRectMake(px, py, pw, ph);
 }
-// ===== [MOD-COLOR-6] refreshVisuals 完整替换：保留原逻辑并在末尾刷新取色器 =====
 - (void)refreshVisuals {
     NSDictionary *pl = plRead();
     BOOL en = [pl[@"enabled"] boolValue];
@@ -2073,7 +2065,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     _mirrorBtn.tintColor = mi ? CGlow() : CTextMain();
 
     BOOL lon = [pl[@"lightEnabled"] boolValue];
-    [_lightBtn setTitle:(lon ? @"彩色注入 · ON" : @"彩色注入 · OFF") forState:UIControlStateNormal];
+    [_lightBtn setTitle:(lon ? @"三色 · ON" : @"三色 · OFF") forState:UIControlStateNormal];
     _lightBtn.backgroundColor = lon ? CGlow() : CBtnBg();
     [_lightBtn setTitleColor:(lon ? CDeep() : CTextMain()) forState:UIControlStateNormal];
 
@@ -2083,8 +2075,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 
     [self refreshLightColorIndicator];
 }
-// ===== [MOD-COLOR-6] end =====
-// ===== [MOD-COLOR-2] 取色器窗口刷新：显示当前 lightColor / 自动采样状态 / 强度 =====
 - (void)refreshLightColorIndicator {
     if (!_lightColorIndicator) return;
     NSDictionary *pl = plRead();
@@ -2116,7 +2106,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     }
     _lightSampleStateLabel.text = [NSString stringWithFormat:@"%@  强度 %d%%", state, v];
 }
-// ===== [MOD-COLOR-2] end =====
 - (void)pickMedia {
     dispatch_async(dispatch_get_main_queue(), ^{
         PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
@@ -2212,45 +2201,21 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
 - (void)zoomBy:(double)f { double z = [plRead()[@"userZoom"] doubleValue] * f; if (z < 0.5) z = 0.5; if (z > 4.0) z = 4.0; plSet(@"userZoom", @(z)); [self toast:[NSString stringWithFormat:@"缩放 %.2f", z]]; }
 - (void)resetTransform { plSetMany(@{@"userPanX": @(0.0), @"userPanY": @(0.0), @"userZoom": @(1.0)}); [self toast:@"已复原"]; }
 - (void)toggleMirror { BOOL m = [plRead()[@"mirrored"] boolValue]; plSet(@"mirrored", @(!m)); [self refreshVisuals]; [self toast:(m ? @"镜像关" : @"镜像开")]; }
-// ===== [MOD-COLOR-4] toggleLight 完整替换：开启自动采样/关闭清色；刷新取色器 =====
 - (void)toggleLight {
     BOOL on = [plRead()[@"lightEnabled"] boolValue];
     if (!on) {
-        plSet(@"lightEnabled", @YES);
+        // 开启三色时先清色：不取到有效色就不映射，避免旧色/残留色立即遮挡人脸
+        plSetMany(@{@"lightEnabled": @YES, @"lightColor": @(0)});
         [self startScreenSampling];
-        [self toast:@"彩色注入开 · 自动取色中"];
+        [self toast:@"三色开 · 自动取色中"];
     } else {
         [self stopScreenSampling];
         plSetMany(@{@"lightEnabled": @NO, @"lightColor": @(0)});
-        [self toast:@"彩色注入关"];
+        [self toast:@"三色关"];
     }
     [self refreshVisuals];
     [self refreshLightColorIndicator];
 }
-// ===== [MOD-COLOR-4] end =====
-// ===== [MOD-COLOR-1] 彩色强度 + / -（移到彩色注入下面后调用） =====
-- (void)lightIntensityUp {
-    NSDictionary *pl = plRead();
-    int v = [pl[@"lightIntensity"] intValue];
-    if (!pl[@"lightIntensity"]) v = 35;
-    v = MIN(100, v + 5);
-    plSet(@"lightIntensity", @(v));
-    [self refreshLightColorIndicator];
-    [self toast:[NSString stringWithFormat:@"彩色增强 %d%%", v]];
-}
-
-- (void)lightIntensityDown {
-    NSDictionary *pl = plRead();
-    int v = [pl[@"lightIntensity"] intValue];
-    if (!pl[@"lightIntensity"]) v = 35;
-    v = MAX(0, v - 5);
-    plSet(@"lightIntensity", @(v));
-    [self refreshLightColorIndicator];
-    [self toast:[NSString stringWithFormat:@"彩色减少 %d%%", v]];
-}
-// ===== [MOD-COLOR-1] end =====
-
-// ===== [彩色注入修复] 30Hz 屏幕采样（对齐 002 startColorSampling）=====
 - (void)startScreenSampling {
     [self stopScreenSampling];
     _screenPickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0
@@ -2260,7 +2225,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     }];
     [self refreshLightColorIndicator];
 }
-
 - (void)stopScreenSampling {
     if (_screenPickTimer) {
         [_screenPickTimer invalidate];
@@ -2268,8 +2232,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
     }
     [self refreshLightColorIndicator];
 }
-
-// ===== [MOD-COLOR-5] screenSampleTick 完整替换：修复 valid==0 清 lightColor 导致注入闭塞 =====
 - (void)screenSampleTick {
     @try {
         CGImageRef img = vcamTakeScreenSnapshot();
@@ -2281,9 +2243,7 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         uint32_t color = vcamPickEdgeColor(img, &valid);
         CGImageRelease(img);
 
-        // [MOD-COLOR-5] 关键修复：边缘没有有效色时，不再把 lightColor 写成 0。
-        // 原逻辑 valid==0 -> lightColor=0，而 VCProc 里 lightColor==0 会直接 return img，
-        // 等于自动取色失败时把彩色注入关掉。这里改为保留上次有效颜色。
+        // 没有有效色时不清 lightColor，保留上次有效色；开启时已先清 0，所以不会旧色注入
         if (valid == 0) {
             [self refreshLightColorIndicator];
             return;
@@ -2303,9 +2263,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         vcamBallLog([NSString stringWithFormat:@"[vcam] screenSampleTick: %@", e]);
     }
 }
-// ===== [MOD-COLOR-5] end =====
-// ===== [彩色注入修复] end =====
-
 - (void)toast:(NSString *)msg {
     if (!_win) return;
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 200, 40)];
@@ -2317,7 +2274,6 @@ static UIButton *makeIconBtn(NSString *sys, CGRect frame, id t, SEL s) {
         [UIView animateWithDuration:0.3 delay:1.2 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL f2){ [l removeFromSuperview]; }];
     }];
 }
-
 - (void)dealloc {
     [self stopScreenSampling];
 }
