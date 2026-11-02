@@ -1056,8 +1056,7 @@ static void vcamExtendEdges(CVPixelBufferRef canvas,
     size_t w = (size_t)ext.size.width, h = (size_t)ext.size.height;
     if (w < 4 || h < 4) return nil;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w, cs, kCGImageAlphaNone);
-    CGColorSpaceRelease(cs);
+ CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w, cs, (CGBitmapInfo)kCGImageAlphaNone);   CGColorSpaceRelease(cs);
     if (!ctx) return nil;
     CGContextSetFillColorWithColor(ctx, [UIColor blackColor].CGColor);
     CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
@@ -1562,7 +1561,7 @@ static uint32_t vcamPickEdgeColor(CGImageRef cgImg, int *outValidSamples) {
         if (!crop) continue;
         unsigned char px[4] = {0};
         CGContextRef ctx = CGBitmapContextCreate(px, 1, 1, 8, 4, cs,
-            kCGImageAlphaPremultipliedLast);
+    (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
         if (ctx) {
             CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), crop);
             CGContextRelease(ctx);
