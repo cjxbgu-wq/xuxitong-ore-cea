@@ -22,16 +22,8 @@
     <false/>
     <key>lightColor</key>
     <integer>0</integer>
-    <key>lightX</key>
-    <integer>50</integer>
-    <key>lightY</key>
-    <integer>50</integer>
     <key>lightIntensity</key>
-    <integer>30</integer>
-    <key>lightDiameter</key>
-    <integer>48</integer>
-    <key>lightFeather</key>
-    <integer>100</integer>
+    <integer>35</integer>
     <key>logEnabled</key>
     <false/>
 </dict>
